@@ -55,7 +55,6 @@
 /////mwb server 192.168.0.197
 /////
 
-
 using DinkToPdf;
 using DinkToPdf.Contracts;
 using Microsoft.EntityFrameworkCore;
@@ -77,7 +76,8 @@ try
 
     Log.Logger = new LoggerConfiguration()
         .MinimumLevel.Information()
-        .MinimumLevel.Override("Microsoft.AspNetCore",
+        .MinimumLevel.Override(
+            "Microsoft.AspNetCore",
             Serilog.Events.LogEventLevel.Warning)
         .Enrich.FromLogContext()
         .WriteTo.Console()
@@ -98,6 +98,13 @@ try
 
     builder.Services.AddSingleton<IConverter>(
         new SynchronizedConverter(new PdfTools()));
+
+    // Registers IHttpClientFactory for your EP integration APIs.
+    // Must be registered before builder.Build().
+    builder.Services.AddHttpClient("EP", client =>
+    {
+        client.Timeout = TimeSpan.FromSeconds(30);
+    });
 
     // Preserved for your testing environment.
     builder.Services.AddCors(options =>
