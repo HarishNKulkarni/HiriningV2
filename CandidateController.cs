@@ -683,7 +683,6 @@ namespace Recruitment.Controllers
 
 
 
-
         [HttpPost("GetCandidateList")]
         public async Task<IActionResult> GetCandidateList(
 [FromBody] GetCandidateListRequest? request)
@@ -1130,6 +1129,13 @@ namespace Recruitment.Controllers
                         x => x.EmployeeId,
                         x => x.EmployeeName);
 
+                var adminEmployeeIds = (await _context.EmployeeMasters
+                    .AsNoTracking()
+                    .Where(x => x.CompanyId == request.CompanyId &&
+                        employeeIds.Contains(x.EmployeeId) && x.IsAdmin == true)
+                    .Select(x => (int?)x.EmployeeId)
+                    .ToListAsync()).ToHashSet();
+
                 string? GetEmployeeName(int? employeeId)
                 {
                     if (employeeId.HasValue &&
@@ -1253,6 +1259,30 @@ namespace Recruitment.Controllers
                         application.CandidateApplicationId,
                         application.JobDescriptionId
                     )].ToList();
+
+                    // Current user's decision only. Another hierarchy's approval
+                    // must not set this user's candidate status to Approved.
+                    var ownStatusAssignmentIds = myPermissions
+                        .Select(x => x.AssignmentId)
+                        .ToHashSet();
+
+                    var ownLatestDecision = applicationHistory
+                        .Where(x =>
+                            x.CreatedBy == request.User &&
+                            x.AssignmentId.HasValue &&
+                            ownStatusAssignmentIds.Contains(x.AssignmentId.Value) &&
+                            IsDecision(x.Action))
+                        .OrderByDescending(x => x.CreatedOn)
+                        .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+                        .FirstOrDefault();
+
+                    string ownRoleStatus = ownLatestDecision?.Action switch
+                    {
+                        "Approve" => "Approved",
+                        "Reject" => "Rejected",
+                        "Return" => "Returned",
+                        _ => "Pending"
+                    };
 
                     var applicationNotifications =
                         notificationsByApplication[(
@@ -1559,6 +1589,148 @@ namespace Recruitment.Controllers
                         };
                     }).ToList();
 
+                    // Append admins who actually added remarks for this application/job.
+                    // Known historical assignments from other templates are excluded.
+                    var adminHistory = applicationHistory
+                        .Where(x =>
+                            adminEmployeeIds.Contains(x.CreatedBy) &&
+                            job != null &&
+                            (!x.AssignmentId.HasValue ||
+                             x.AssignmentId.Value == 0 ||
+                             (assignmentsById.TryGetValue(
+                                 x.AssignmentId.Value, out var linkedAssignment) &&
+                              linkedAssignment.TemplateId == job.TemplateId)))
+                        .ToList();
+
+                    var adminPathEntries = adminHistory
+                        .GroupBy(x => x.CreatedBy)
+                        .Where(group => group.Any(x => x.IsRemarkAdded &&
+                            !string.IsNullOrWhiteSpace(x.Remarks)))
+                        .OrderBy(group => group.Key)
+                        .Select(group =>
+                        {
+                            var adminRemarks = group
+                                .Where(x => x.IsRemarkAdded &&
+                                    !string.IsNullOrWhiteSpace(x.Remarks))
+                                .OrderBy(x => x.CreatedOn)
+                                .ThenBy(x => x.CandidateSkillAssessmentHistoryId)
+                                .ToList();
+
+                            var latestAdminDecision = group
+                                .Where(x => IsDecision(x.Action))
+                                .OrderByDescending(x => x.CreatedOn)
+                                .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+                                .FirstOrDefault();
+
+                            return new
+                            {
+                                TemplateId = job?.TemplateId,
+                                AssignmentId = (int?)null,
+                                HierarchyLevel = (int?)null,
+                                HierarchyLabel = "Admin",
+                                RoleId = (int?)null,
+                                RoleName = "Admin",
+                                EmployeeId = group.Key,
+                                EmployeeName = GetEmployeeName(group.Key),
+                                Stage = "Admin",
+                                IsAdmin = true,
+                                // Admin cards are activity entries, not role assignments.
+                                CanApprove = (bool?)null,
+                                CanReject = (bool?)null,
+                                CanReturn = (bool?)null,
+                                ReportingToAssignmentId = (int?)null,
+                                ReportingToEmployeeId = (int?)null,
+                                ReportingToEmployeeName = (string?)null,
+                                ReportingToRoleName = (string?)null,
+                                IsCurrentTemplate = true,
+                                HasActivity = true,
+                                Status = latestAdminDecision?.Action switch
+                                {
+                                    "Approve" => "Approved",
+                                    "Reject" => "Rejected",
+                                    "Return" => "Returned",
+                                    _ => "Pending"
+                                },
+                                LatestDecision = latestAdminDecision?.Action,
+                                LatestDecisionStatus = latestAdminDecision?.NewStatus,
+                                LatestDecisionOn = latestAdminDecision?.CreatedOn,
+                                LatestDecisionBy = latestAdminDecision?.CreatedBy,
+                                LatestDecisionByName =
+                                    GetEmployeeName(latestAdminDecision?.CreatedBy),
+                                HistoryCount = adminRemarks.Count,
+                                DecisionCount = adminRemarks.Count(x => IsDecision(x.Action)),
+                                RemarksCount = adminRemarks.Count,
+                                History = adminRemarks.Select(history => new
+                                {
+                                    HistoryId = history.CandidateSkillAssessmentHistoryId,
+                                    history.CandidateSkillAssessmentHistoryId,
+                                    history.CandidateSkillAssessmentId,
+                                    history.CandidateApplicationId,
+                                    history.JobDescriptionId,
+                                    history.AssignmentId,
+                                    history.CompanySkillMasterId,
+                                    SkillId = history.CompanySkillMasterId,
+                                    SkillName = GetSkillName(history.CompanySkillMasterId),
+                                    IsDefaultRemark = history.CompanySkillMasterId == 0,
+                                    DisplayTitle = history.CompanySkillMasterId == 0
+                                        ? "Admin Remark"
+                                        : GetSkillName(history.CompanySkillMasterId),
+                                    Stage = "Admin",
+                                    history.Action,
+                                    history.PreviousStatus,
+                                    history.NewStatus,
+                                    Status = history.NewStatus,
+                                    history.Score,
+                                    history.Remarks,
+                                    history.IsRemarkAdded,
+                                    EmployeeId = history.CreatedBy,
+                                    EmployeeName = GetEmployeeName(history.CreatedBy),
+                                    history.CreatedBy,
+                                    CreatedByName = GetEmployeeName(history.CreatedBy),
+                                    history.CreatedOn,
+                                    history.ModifiedBy,
+                                    ModifiedByName = GetEmployeeName(history.ModifiedBy),
+                                    history.ModifiedOn
+                                }).ToList()
+                            };
+                        }).ToList();
+
+                    var approvalPathWithAdmins = approvalPath.Cast<object>()
+                        .Concat(adminPathEntries.Cast<object>())
+                        .ToList();
+
+                    // Viewer-specific flag: own approval as admin or at last hierarchy.
+                    int? lastHierarchyLevel = assignmentRows
+                        .Where(x => job != null &&
+                            x.TemplateId == job.TemplateId &&
+                            activePermissionTemplateIds.Contains(x.TemplateId) &&
+                            x.IsActive == true)
+                        .Select(x => (int?)x.HierarchyLevel)
+                        .Max();
+
+                    var myLastAssignmentIds = myPermissions
+                        .Where(x => x.HierarchyLevel == lastHierarchyLevel)
+                        .Select(x => x.AssignmentId)
+                        .ToHashSet();
+
+                    var onboardingDecision = accessUser.IsAdmin == true
+                        ? adminHistory
+                            .Where(x => x.CreatedBy == request.User &&
+                                IsDecision(x.Action))
+                            .OrderByDescending(x => x.CreatedOn)
+                            .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+                            .FirstOrDefault()
+                        : applicationHistory
+                            .Where(x => x.CreatedBy == request.User &&
+                                x.AssignmentId.HasValue &&
+                                myLastAssignmentIds.Contains(x.AssignmentId.Value) &&
+                                IsDecision(x.Action))
+                            .OrderByDescending(x => x.CreatedOn)
+                            .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+                            .FirstOrDefault();
+
+                    bool isOnBoarding = onboardingDecision?.Action == "Approve";
+
                     // Preserve visibility of admin/unlinked history without
                     // inventing an assignment or hierarchy for its author.
                     var unassignedHistory = applicationHistory
@@ -1765,7 +1937,11 @@ namespace Recruitment.Controllers
                         application.Remarks,
 
                         application.Stage,
-                        ApplicationStatus = application.Status,
+                        // Preserve the frontend's existing ApplicationStatus field.
+                        // Admin sees the stored status; role users see their own decision.
+                        ApplicationStatus = accessUser.IsAdmin == true
+                            ? application.Status
+                            : ownRoleStatus,
                         application.AppliedOn,
                         application.IsActive,
 
@@ -1837,7 +2013,8 @@ namespace Recruitment.Controllers
                         ResumeHistoryId = resumeHistoryId,
 
                         MyPermissions = myPermissions,
-                        ApprovalPath = approvalPath,
+                        ApprovalPath = approvalPathWithAdmins,
+                        IsOnBoarding = isOnBoarding,
                         UnassignedApprovalHistory = unassignedHistory,
 
                         HasPendingActionRequest = yourTask.Count > 0,
@@ -1867,6 +2044,8 @@ namespace Recruitment.Controllers
                 });
             }
         }
+
+
 
         //        [HttpPost("GetCandidateList")]
         //        public async Task<IActionResult> GetCandidateList(
@@ -2438,6 +2617,30 @@ namespace Recruitment.Controllers
         //                        application.JobDescriptionId
         //                    )].ToList();
 
+        //                    // Current user's decision only. Another hierarchy's approval
+        //                    // must not set this user's candidate status to Approved.
+        //                    var ownStatusAssignmentIds = myPermissions
+        //                        .Select(x => x.AssignmentId)
+        //                        .ToHashSet();
+
+        //                    var ownLatestDecision = applicationHistory
+        //                        .Where(x =>
+        //                            x.CreatedBy == request.User &&
+        //                            x.AssignmentId.HasValue &&
+        //                            ownStatusAssignmentIds.Contains(x.AssignmentId.Value) &&
+        //                            IsDecision(x.Action))
+        //                        .OrderByDescending(x => x.CreatedOn)
+        //                        .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+        //                        .FirstOrDefault();
+
+        //                    string ownRoleStatus = ownLatestDecision?.Action switch
+        //                    {
+        //                        "Approve" => "Approved",
+        //                        "Reject" => "Rejected",
+        //                        "Return" => "Returned",
+        //                        _ => "Pending"
+        //                    };
+
         //                    var applicationNotifications =
         //                        notificationsByApplication[(
         //                            application.CandidateApplicationId,
@@ -2494,7 +2697,7 @@ namespace Recruitment.Controllers
         //                            .Where(x =>
         //                                x.AssignmentId == resumeAssignmentId &&
         //                                x.CreatedBy == request.User &&
-        //                                x.IsRemarkAdded == false)
+        //                                x.IsResume == true)
         //                            .OrderByDescending(x => x.CreatedOn)
         //                            .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
         //                            .FirstOrDefault();
@@ -2509,7 +2712,29 @@ namespace Recruitment.Controllers
         //                                if (root.ValueKind == System.Text.Json.JsonValueKind.Object &&
         //                                    root.EnumerateObject().Any())
         //                                {
-        //                                    resumeDetails = root.Clone();
+        //                                    // Keep the saved detail fields and add authoritative
+        //                                    // identifiers from the history record, not its JSON.
+        //                                    var detailsWithIds = new Dictionary<string, object?>(
+        //                                        StringComparer.OrdinalIgnoreCase);
+
+        //                                    foreach (var property in root.EnumerateObject())
+        //                                    {
+        //                                        if (string.Equals(property.Name, "CandidateSkillAssessmentId", StringComparison.OrdinalIgnoreCase) ||
+        //                                            string.Equals(property.Name, "CompanyId", StringComparison.OrdinalIgnoreCase) ||
+        //                                            string.Equals(property.Name, "JobDescriptionId", StringComparison.OrdinalIgnoreCase) ||
+        //                                            string.Equals(property.Name, "CandidateApplicationId", StringComparison.OrdinalIgnoreCase))
+        //                                        {
+        //                                            continue;
+        //                                        }
+
+        //                                        detailsWithIds[property.Name] = property.Value.Clone();
+        //                                    }
+
+        //                                    detailsWithIds["candidateSkillAssessmentId"] = resumeHistory.CandidateSkillAssessmentId;
+        //                                    detailsWithIds["companyId"] = resumeHistory.CompanyId;
+        //                                    detailsWithIds["jobDescriptionId"] = resumeHistory.JobDescriptionId;
+        //                                    detailsWithIds["candidateApplicationId"] = resumeHistory.CandidateApplicationId;
+        //                                    resumeDetails = detailsWithIds;
         //                                    resumeDetailsSource = "History";
         //                                    resumeHistoryId = resumeHistory.CandidateSkillAssessmentHistoryId;
         //                                }
@@ -2526,6 +2751,11 @@ namespace Recruitment.Controllers
         //                            resumeDetailsSource = "Candidate";
         //                            resumeDetails = new
         //                            {
+        //                                // Null when no saved resume record exists.
+        //                                CandidateSkillAssessmentId = (int?)resumeHistory?.CandidateSkillAssessmentId,
+        //                                application.CompanyId,
+        //                                application.JobDescriptionId,
+        //                                application.CandidateApplicationId,
         //                                candidate.CandidateId,
         //                                candidate.FirstName,
         //                                candidate.MiddleName,
@@ -2922,7 +3152,11 @@ namespace Recruitment.Controllers
         //                        application.Remarks,
 
         //                        application.Stage,
-        //                        ApplicationStatus = application.Status,
+        //                        // Preserve the frontend's existing ApplicationStatus field.
+        //                        // Admin sees the stored status; role users see their own decision.
+        //                        ApplicationStatus = accessUser.IsAdmin == true
+        //                            ? application.Status
+        //                            : ownRoleStatus,
         //                        application.AppliedOn,
         //                        application.IsActive,
 
@@ -3024,6 +3258,9 @@ namespace Recruitment.Controllers
         //                });
         //            }
         //        }
+
+
+
 
 
 

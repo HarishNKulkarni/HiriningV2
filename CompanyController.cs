@@ -650,7 +650,8 @@ namespace IMS.Controllers
                 "Role Assignment",
                 "Job Description",
                 "JD Statistics",
-                "Candidate"
+                "Candidate",
+                "OnBoading"
                     }
                     : new[]
                     {

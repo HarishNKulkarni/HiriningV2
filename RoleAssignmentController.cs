@@ -2264,6 +2264,314 @@ namespace Recruitment.Controllers
 
 
 
+
+
+
+        [HttpPost("GetRoleMappingSummary")]
+        public async Task<IActionResult> GetRoleMappingSummary(
+    [FromBody] GetRoleMappingSummaryRequest? request)
+        {
+            IActionResult Fail(int code, string message)
+            {
+                return StatusCode(code, new
+                {
+                    Status = false,
+                    Message = message
+                });
+            }
+
+            if (request == null ||
+                request.CompanyId <= 0 ||
+                request.UserId <= 0)
+            {
+                return Fail(
+                    400,
+                    "Valid CompanyId and UserId are required.");
+            }
+
+            if (request.RoleIds?.Any(id => id < 0) == true)
+            {
+                return Fail(400, "RoleIds cannot contain negative values.");
+            }
+
+            try
+            {
+                var currentUser = await _context.EmployeeMasters
+                    .AsNoTracking()
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.EmployeeId == request.UserId)
+                    .Select(x => new
+                    {
+                        x.EmployeeId,
+                        x.IsActive,
+                        x.IsAdmin
+                    })
+                    .FirstOrDefaultAsync();
+
+                if (currentUser == null)
+                {
+                    return Fail(
+                        404,
+                        "Employee not found for this company.");
+                }
+
+                if (currentUser.IsActive != true)
+                    return Fail(403, "Employee is inactive.");
+
+                if (currentUser.IsAdmin != true)
+                {
+                    return Fail(
+                        403,
+                        "Only admins can view the role mapping summary.");
+                }
+
+                var company = await _context.Companys
+                    .AsNoTracking()
+                    .Where(x => x.CompanyID == request.CompanyId)
+                    .Select(x => new
+                    {
+                        x.CompanyID,
+                        x.CompanyName
+                    })
+                    .FirstOrDefaultAsync();
+
+                if (company == null)
+                    return Fail(404, "Company not found.");
+
+                bool allRoles =
+                    request.RoleIds == null ||
+                    request.RoleIds.Count == 0 ||
+                    request.RoleIds.Contains(0);
+
+                var selectedRoleIds = allRoles
+                    ? Array.Empty<int>()
+                    : request.RoleIds!.Distinct().ToArray();
+
+                // Include company roles even when they have no assignments.
+                var rolesQuery = _context.Roles
+                    .AsNoTracking()
+                    .Where(x => x.CompanyId == request.CompanyId);
+
+                if (!allRoles)
+                {
+                    rolesQuery = rolesQuery.Where(x =>
+                        selectedRoleIds.Contains(x.RoleId));
+                }
+
+                var roles = await rolesQuery
+                    .Select(x => new
+                    {
+                        x.RoleId,
+                        x.RoleName,
+                        x.IsActive
+                    })
+                    .OrderBy(x => x.RoleName)
+                    .ThenBy(x => x.RoleId)
+                    .ToListAsync();
+
+                if (!allRoles && roles.Count != selectedRoleIds.Length)
+                {
+                    return Fail(
+                        400,
+                        "One or more selected roles do not belong to this company.");
+                }
+
+                var roleIds = roles
+                    .Select(x => x.RoleId)
+                    .ToArray();
+
+                // Role membership comes from the template assignment.
+                // Do not use EmployeeMasters.RoleId for this summary.
+                var mappings = await (
+                    from assignment in _context.RoleTemplateAssignment
+                        .AsNoTracking()
+
+                    join template in _context.RoleTemplates.AsNoTracking()
+                        on new
+                        {
+                            assignment.CompanyId,
+                            assignment.TemplateId
+                        }
+                        equals new
+                        {
+                            template.CompanyId,
+                            template.TemplateId
+                        }
+
+                    join employee in _context.EmployeeMasters.AsNoTracking()
+                        on new
+                        {
+                            assignment.CompanyId,
+                            assignment.EmployeeId
+                        }
+                        equals new
+                        {
+                            employee.CompanyId,
+                            employee.EmployeeId
+                        }
+
+                    where assignment.CompanyId == request.CompanyId &&
+                          roleIds.Contains(assignment.RoleId) &&
+                          assignment.IsActive == true &&
+                          template.IsActive == true
+
+                    select new
+                    {
+                        assignment.AssignmentId,
+                        assignment.RoleId,
+                        assignment.TemplateId,
+
+                        template.TemplateName,
+
+                        employee.EmployeeId,
+                        employee.EmpCode,
+                        employee.FirstName,
+                        employee.LastName,
+                        employee.Email,
+                        employee.Mobilenumber,
+                        EmployeeIsActive = employee.IsActive,
+
+                        assignment.HierarchyLevel,
+                        assignment.Stage,
+                        assignment.ReportingToAssignmentId,
+
+                        assignment.CanApprove,
+                        assignment.CanReject,
+                        assignment.CanReturn
+                    }
+                ).ToListAsync();
+
+                var mappingsByRole = mappings.ToLookup(x => x.RoleId);
+
+                var data = roles.Select(role =>
+                {
+                    var roleMappings = mappingsByRole[role.RoleId]
+                        .ToList();
+
+                    var templates = roleMappings
+                        .GroupBy(x => new
+                        {
+                            x.TemplateId,
+                            x.TemplateName
+                        })
+                        .OrderBy(group => group.Key.TemplateName)
+                        .ThenBy(group => group.Key.TemplateId)
+                        .Select(group => new
+                        {
+                            group.Key.TemplateId,
+                            group.Key.TemplateName,
+
+                            EmployeeCount = group
+                                .Select(x => x.EmployeeId)
+                                .Distinct()
+                                .Count(),
+
+                            AssignmentCount = group.Count(),
+
+                            Employees = group
+                                .OrderBy(x => x.HierarchyLevel)
+                                .ThenBy(x => x.AssignmentId)
+                                .Select(x => new
+                                {
+                                    x.AssignmentId,
+
+                                    x.EmployeeId,
+                                    EmployeeCode = x.EmpCode,
+
+                                    EmployeeName =
+                                        ((x.FirstName ?? "") + " " +
+                                         (x.LastName ?? "")).Trim(),
+
+                                    x.Email,
+                                    MobileNumber = x.Mobilenumber,
+                                    IsActive = x.EmployeeIsActive,
+
+                                    x.HierarchyLevel,
+                                    HierarchyLabel = $"H{x.HierarchyLevel}",
+                                    x.Stage,
+                                    x.ReportingToAssignmentId,
+
+                                    CanApprove = x.CanApprove == true,
+                                    CanReject = x.CanReject == true,
+                                    CanReturn = x.CanReturn == true
+                                })
+                                .ToList()
+                        })
+                        .ToList();
+
+                    return new
+                    {
+                        role.RoleId,
+                        role.RoleName,
+                        role.IsActive,
+
+                        TemplateCount = templates.Count,
+
+                        EmployeeCount = roleMappings
+                            .Select(x => x.EmployeeId)
+                            .Distinct()
+                            .Count(),
+
+                        AssignmentCount = roleMappings.Count,
+
+                        Templates = templates
+                    };
+                }).ToList();
+
+                return Ok(new
+                {
+                    Status = true,
+                    Message = data.Count > 0
+                        ? "Role mapping summary fetched successfully."
+                        : "No roles found.",
+
+                    CompanyId = company.CompanyID,
+                    company.CompanyName,
+                    IsAdmin = true,
+
+                    TotalRoles = data.Count,
+
+                    TotalTemplates = mappings
+                        .Select(x => x.TemplateId)
+                        .Distinct()
+                        .Count(),
+
+                    TotalEmployees = mappings
+                        .Select(x => x.EmployeeId)
+                        .Distinct()
+                        .Count(),
+
+                    TotalAssignments = mappings.Count,
+
+                    Data = data
+                });
+            }
+            catch (Exception ex)
+            {
+                Serilog.Log.Error(
+                    ex,
+                    "Failed to fetch role mapping summary for CompanyId {CompanyId}, UserId {UserId}.",
+                    request.CompanyId,
+                    request.UserId);
+
+                return StatusCode(500, new
+                {
+                    Status = false,
+                    Message = "Unable to fetch role mapping summary."
+                });
+            }
+        }
+        public class GetRoleMappingSummaryRequest
+        {
+            public int CompanyId { get; set; }
+            public int UserId { get; set; }
+
+            // null, [], or [0] means all company roles.
+            public List<int>? RoleIds { get; set; }
+        }
+
+
         public class GetEmployeeAssignedModuleAccessRequest
         {
             public int CompanyId { get; set; }
