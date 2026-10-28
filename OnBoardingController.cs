@@ -26,11 +26,7 @@ namespace Recruitment.Controllers
 
 
 
-
-
-      
-
-
+        // Replace the existing method inside your controller; retain its route attribute.
         [HttpPost("SaveOnboardingTeam")]
         public async Task<IActionResult> SaveOnboardingTeam(
     [FromBody] SaveOnboardingTeamRequest? request)
@@ -68,7 +64,36 @@ namespace Recruitment.Controllers
                 ? null
                 : request.CompanySkillMasterId;
 
-            var suppliedTemplateIds = request.TemplateIds ?? new List<int>();
+            if (request.Templates != null)
+            {
+                if (request.Templates.Any(x => x == null || x.TemplateId <= 0))
+                    return Fail(400, "Valid reporting TemplateId is required.");
+                if (request.Templates.GroupBy(x => x.TemplateId).Any(g => g.Count() > 1))
+                    return Fail(400, "Duplicate reporting templates are not allowed.");
+
+                foreach (var item in request.Templates)
+                {
+                    var ids = item.ReportingToEmployeeIds ?? new List<int>();
+                    if (ids.Any(id => id <= 0) || ids.Distinct().Count() != ids.Count)
+                        return Fail(400, "Reporting employee IDs must be positive and cannot repeat within a template.");
+                }
+
+                if (request.TemplateIds != null)
+                {
+                    if (request.TemplateIds.Any(id => id < 0) ||
+                        request.TemplateIds.Distinct().Count() != request.TemplateIds.Count ||
+                        (request.TemplateIds.Contains(0) && request.TemplateIds.Any(id => id > 0)))
+                        return Fail(400, "Invalid or duplicate TemplateIds.");
+
+                    if (!request.TemplateIds.Where(id => id > 0).ToHashSet()
+                        .SetEquals(request.Templates.Select(x => x.TemplateId)))
+                        return Fail(400, "TemplateIds and Templates must select the same templates.");
+                }
+            }
+
+            var suppliedTemplateIds = request.Templates != null
+                ? request.Templates.Select(x => x.TemplateId).ToList()
+                : request.TemplateIds ?? new List<int>();
 
             if (suppliedTemplateIds.Any(id => id < 0))
                 return Fail(400, "TemplateIds cannot contain negative IDs.");
@@ -249,6 +274,37 @@ namespace Recruitment.Controllers
                         return Fail(
                             400,
                             "Select active templates belonging to this company.");
+                    }
+                }
+
+                if (request.Templates != null)
+                {
+                    var reportingIds = request.Templates
+                        .SelectMany(x => x.ReportingToEmployeeIds ?? new List<int>())
+                        .Distinct().ToList();
+
+                    if (reportingIds.Count > 0)
+                    {
+                        var validAssignments = await (
+                            from a in _context.RoleTemplateAssignment.AsNoTracking()
+                            join e in _context.EmployeeMasters.AsNoTracking()
+                                on new { a.CompanyId, a.EmployeeId }
+                                equals new { e.CompanyId, e.EmployeeId }
+                            where a.CompanyId == request.CompanyId &&
+                                  templateIds.Contains(a.TemplateId) &&
+                                  reportingIds.Contains(a.EmployeeId) &&
+                                  a.IsActive == true && e.IsActive == true
+                            select new { a.TemplateId, a.EmployeeId }
+                        ).Distinct().ToListAsync();
+
+                        var validPairs = validAssignments
+                            .Select(x => (x.TemplateId, x.EmployeeId)).ToHashSet();
+
+                        foreach (var item in request.Templates)
+                            foreach (var id in item.ReportingToEmployeeIds ?? new List<int>())
+                                if (!validPairs.Contains((item.TemplateId, id)))
+                                    return Fail(400,
+                                        $"Reporting employee {id} must be active and assigned to template {item.TemplateId} in this company.");
                     }
                 }
 
@@ -433,7 +489,60 @@ namespace Recruitment.Controllers
                     }
                 }
 
+                var reportings = await _context.OnboardingTeamReportings
+                    .Where(x => x.CompanyId == request.CompanyId &&
+                                x.OnboardingTeamId == team.OnboardingTeamId)
+                    .ToListAsync();
+
+                var selectedPairs = new HashSet<(int TemplateId, int EmployeeId)>();
+                if (request.Templates != null)
+                    foreach (var item in request.Templates)
+                        foreach (var id in item.ReportingToEmployeeIds ?? new List<int>())
+                            selectedPairs.Add((item.TemplateId, id));
+
+                foreach (var mapping in reportings)
+                {
+                    // Omitted Templates preserves retained template reporting mappings.
+                    // Removed templates always deactivate their reporting mappings.
+                    bool active = selectedTemplateIds.Contains(mapping.TemplateId) &&
+                        (request.Templates == null ? mapping.IsActive :
+                         selectedPairs.Contains((mapping.TemplateId, mapping.ReportingToEmployeeId)));
+                    if (mapping.IsActive != active)
+                    {
+                        mapping.IsActive = active;
+                        mapping.ModifiedBy = admin.EmployeeId;
+                        mapping.ModifiedOn = now;
+                    }
+                }
+
+                var existingPairs = reportings
+                    .Select(x => (x.TemplateId, x.ReportingToEmployeeId)).ToHashSet();
+
+                foreach (var pair in selectedPairs)
+                {
+                    if (!existingPairs.Contains((pair.TemplateId, pair.EmployeeId)))
+                        _context.OnboardingTeamReportings.Add(new OnboardingTeamReporting
+                        {
+                            CompanyId = request.CompanyId,
+                            OnboardingTeamId = team.OnboardingTeamId,
+                            TemplateId = pair.TemplateId,
+                            ReportingToEmployeeId = pair.EmployeeId,
+                            IsActive = true,
+                            CreatedBy = admin.EmployeeId,
+                            CreatedOn = now
+                        });
+                }
+
                 await _context.SaveChangesAsync();
+
+                var savedReportings = await _context.OnboardingTeamReportings
+                    .AsNoTracking()
+                    .Where(x => x.CompanyId == request.CompanyId &&
+                                x.OnboardingTeamId == team.OnboardingTeamId &&
+                                x.IsActive == true)
+                    .OrderBy(x => x.TemplateId).ThenBy(x => x.ReportingToEmployeeId)
+                    .Select(x => new { x.TemplateId, x.ReportingToEmployeeId })
+                    .ToListAsync();
 
                 var savedMembers = await _context.OnboardingTeamMembers
                     .AsNoTracking()
@@ -473,6 +582,14 @@ namespace Recruitment.Controllers
 
                         AllTemplates = templateIds.Count == 0,
                         TemplateIds = templateIds.OrderBy(x => x).ToList(),
+                        Templates = templateIds.OrderBy(x => x).Select(id => new
+                        {
+                            TemplateId = id,
+                            ReportingToEmployeeIds = savedReportings
+                                .Where(x => x.TemplateId == id)
+                                .Select(x => x.ReportingToEmployeeId).ToList()
+                        }).ToList(),
+
 
                         ActiveMemberCount = savedMembers.Count(x => x.IsActive),
                         Members = savedMembers,
@@ -523,9 +640,10 @@ namespace Recruitment.Controllers
         }
 
 
+
         [HttpPost("GetOnboardingTeamList")]
         public async Task<IActionResult> GetOnboardingTeamList(
-    [FromBody] GetOnboardingTeamListRequest? request)
+[FromBody] GetOnboardingTeamListRequest? request)
         {
             IActionResult Fail(int code, string message)
             {
@@ -669,17 +787,33 @@ namespace Recruitment.Controllers
                     })
                     .ToDictionaryAsync(x => x.RoleId);
 
+                // Saved reporting selections only; do not change team access rules.
+                var reportingMappings = await _context.OnboardingTeamReportings
+                    .AsNoTracking()
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        teamIds.Contains(x.OnboardingTeamId) &&
+                        x.IsActive == true)
+                    .OrderBy(x => x.ReportingToEmployeeId)
+                    .ToListAsync();
+
                 var employeeIds = members
                     .Select(x => (int?)x.EmployeeId)
+                    .Concat(reportingMappings.SelectMany(x => new int?[]
+                    {
+                    x.ReportingToEmployeeId,
+                    x.CreatedBy,
+                    x.ModifiedBy
+                    }))
                     .Concat(teams.SelectMany(x => new int?[]
                     {
-                x.CreatedBy,
-                x.ModifiedBy
+            x.CreatedBy,
+            x.ModifiedBy
                     }))
                     .Concat(members.SelectMany(x => new int?[]
                     {
-                x.CreatedBy,
-                x.ModifiedBy
+            x.CreatedBy,
+            x.ModifiedBy
                     }))
                     .Where(x => x.HasValue)
                     .Select(x => x!.Value)
@@ -714,6 +848,9 @@ namespace Recruitment.Controllers
 
                 var templatesByTeam = templateMappings.ToLookup(
                     x => x.OnboardingTeamId);
+
+                var reportingByTeamTemplate = reportingMappings.ToLookup(
+                    x => (x.OnboardingTeamId, x.TemplateId));
 
                 var data = teams.Select(team =>
                 {
@@ -755,12 +892,45 @@ namespace Recruitment.Controllers
                             templates.TryGetValue(
                                 mapping.TemplateId, out var template);
 
+                            var templateReportings = reportingByTeamTemplate[
+                                (team.OnboardingTeamId, mapping.TemplateId)].ToList();
+
                             return new
                             {
                                 mapping.OnboardingTeamTemplateId,
                                 mapping.TemplateId,
                                 TemplateName = template?.TemplateName,
                                 IsActive = template?.IsActive,
+
+                                ReportingToEmployeeIds = templateReportings
+                                    .Select(x => x.ReportingToEmployeeId)
+                                    .Distinct()
+                                    .ToList(),
+
+                                ReportingToEmployees = templateReportings.Select(reporting =>
+                                {
+                                    employees.TryGetValue(
+                                        reporting.ReportingToEmployeeId,
+                                        out var reportingEmployee);
+
+                                    return new
+                                    {
+                                        reporting.OnboardingTeamReportingId,
+                                        reporting.ReportingToEmployeeId,
+                                        EmployeeName = reportingEmployee?.EmployeeName,
+                                        EmployeeIsActive = reportingEmployee?.IsActive,
+                                        reporting.IsActive,
+
+                                        reporting.CreatedBy,
+                                        CreatedByName = GetEmployeeName(reporting.CreatedBy),
+                                        reporting.CreatedOn,
+
+                                        reporting.ModifiedBy,
+                                        ModifiedByName = GetEmployeeName(reporting.ModifiedBy),
+                                        reporting.ModifiedOn
+                                    };
+                                }).ToList(),
+
                                 mapping.CreatedOn,
                                 mapping.CreatedBy
                             };
@@ -843,26 +1013,2616 @@ namespace Recruitment.Controllers
         }
 
 
+        //    [HttpPost("SaveOnboardingTeam")]
+        //    public async Task<IActionResult> SaveOnboardingTeam(
+        //[FromBody] SaveOnboardingTeamRequest? request)
+        //    {
+        //        IActionResult Fail(int statusCode, string message)
+        //        {
+        //            return StatusCode(statusCode, new
+        //            {
+        //                Status = false,
+        //                Message = message
+        //            });
+        //        }
+
+        //        if (request == null)
+        //            return Fail(400, "Invalid request.");
+
+        //        if (request.CompanyId <= 0 || request.UserId <= 0)
+        //            return Fail(400, "Valid CompanyId and UserId are required.");
+
+        //        if (request.OnboardingTeamId < 0)
+        //            return Fail(400, "Invalid OnboardingTeamId.");
+
+        //        var teamName = request.TeamName?.Trim();
+
+        //        if (string.IsNullOrWhiteSpace(teamName))
+        //            return Fail(400, "Team name is required.");
+
+        //        if (teamName.Length > 150)
+        //            return Fail(400, "Team name cannot exceed 150 characters.");
+
+        //        if (request.CompanySkillMasterId.GetValueOrDefault() < 0)
+        //            return Fail(400, "Invalid CompanySkillMasterId.");
+
+        //        int? skillId = request.CompanySkillMasterId.GetValueOrDefault() == 0
+        //            ? null
+        //            : request.CompanySkillMasterId;
+
+        //        var suppliedTemplateIds = request.TemplateIds ?? new List<int>();
+
+        //        if (suppliedTemplateIds.Any(id => id < 0))
+        //            return Fail(400, "TemplateIds cannot contain negative IDs.");
+
+        //        // Avoid accidentally granting all-template access from a mixed list.
+        //        if (suppliedTemplateIds.Contains(0) &&
+        //            suppliedTemplateIds.Any(id => id > 0))
+        //        {
+        //            return Fail(
+        //                400,
+        //                "Send selected TemplateIds, or [0] for all templates. Do not mix them.");
+        //        }
+
+        //        if (suppliedTemplateIds.Distinct().Count() != suppliedTemplateIds.Count)
+        //            return Fail(400, "Duplicate TemplateIds are not allowed.");
+
+        //        var templateIds = suppliedTemplateIds
+        //            .Where(id => id > 0)
+        //            .ToList();
+
+        //        if (request.Members == null || request.Members.Count == 0)
+        //            return Fail(400, "At least one team member is required.");
+
+        //        foreach (var member in request.Members)
+        //        {
+        //            if (member == null)
+        //                return Fail(400, "Team member cannot be null.");
+
+        //            if (member.EmployeeId <= 0)
+        //                return Fail(400, "Every member must have a valid EmployeeId.");
+
+        //            if (member.RoleId.GetValueOrDefault() < 0)
+        //                return Fail(400, "Invalid member RoleId.");
+
+        //            if (member.RoleId == 0)
+        //                member.RoleId = null;
+        //        }
+
+        //        if (request.Members
+        //            .GroupBy(x => x.EmployeeId)
+        //            .Any(group => group.Count() > 1))
+        //        {
+        //            return Fail(400, "An employee cannot repeat within the same team.");
+        //        }
+
+        //        if (request.IsActive && !request.Members.Any(x => x.IsActive))
+        //        {
+        //            return Fail(
+        //                400,
+        //                "An active team must have at least one active member.");
+        //        }
+
+        //        bool isNew = request.OnboardingTeamId == 0;
+
+        //        try
+        //        {
+        //            await using var transaction =
+        //                await _context.Database.BeginTransactionAsync(
+        //                    IsolationLevel.Serializable);
+
+        //            var companyExists = await _context.Companys
+        //                .AsNoTracking()
+        //                .AnyAsync(x => x.CompanyID == request.CompanyId);
+
+        //            if (!companyExists)
+        //                return Fail(404, "Company not found.");
+
+        //            var admin = await _context.EmployeeMasters
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.EmployeeId == request.UserId)
+        //                .Select(x => new
+        //                {
+        //                    x.EmployeeId,
+        //                    x.IsActive,
+        //                    x.IsAdmin
+        //                })
+        //                .FirstOrDefaultAsync();
+
+        //            if (admin == null)
+        //                return Fail(404, "User not found for this company.");
+
+        //            if (admin.IsActive != true)
+        //                return Fail(403, "User is inactive.");
+
+        //            if (admin.IsAdmin != true)
+        //            {
+        //                return Fail(
+        //                    403,
+        //                    "Only an admin can create or update onboarding teams.");
+        //            }
+
+        //            OnboardingTeam team;
+
+        //            if (isNew)
+        //            {
+        //                team = new OnboardingTeam
+        //                {
+        //                    CompanyId = request.CompanyId
+        //                };
+        //            }
+        //            else
+        //            {
+        //                var existingTeam = await _context.OnboardingTeams
+        //                    .FirstOrDefaultAsync(x =>
+        //                        x.CompanyId == request.CompanyId &&
+        //                        x.OnboardingTeamId == request.OnboardingTeamId);
+
+        //                if (existingTeam == null)
+        //                    return Fail(404, "Onboarding team not found for this company.");
+
+        //                team = existingTeam;
+        //            }
+
+        //            // Case-insensitive uniqueness within the company.
+        //            var duplicateName = await _context.OnboardingTeams
+        //                .AnyAsync(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.OnboardingTeamId != request.OnboardingTeamId &&
+        //                    EF.Functions.Collate(
+        //                        x.TeamName.Trim(),
+        //                        "SQL_Latin1_General_CP1_CI_AS") == teamName);
+
+        //            if (duplicateName)
+        //            {
+        //                return Fail(
+        //                    409,
+        //                    "An onboarding team with this name already exists.");
+        //            }
+
+        //            // Validate the optional skill only when supplied.
+        //            if (skillId.HasValue)
+        //            {
+        //                var validSkill = await (
+        //                    from skill in _context.CompanySkillMasters.AsNoTracking()
+
+        //                    join category in _context.CompanySkillMappings.AsNoTracking()
+        //                        on new
+        //                        {
+        //                            skill.CompanyId,
+        //                            skill.SkillMappingId
+        //                        }
+        //                        equals new
+        //                        {
+        //                            category.CompanyId,
+        //                            category.SkillMappingId
+        //                        }
+
+        //                    where skill.CompanyId == request.CompanyId
+        //                          && skill.CompanySkillMasterId == skillId.Value
+        //                          && skill.IsActive == true
+        //                          && category.IsActive == true
+
+        //                    select skill.CompanySkillMasterId
+        //                ).AnyAsync();
+
+        //                if (!validSkill)
+        //                {
+        //                    return Fail(
+        //                        400,
+        //                        "Select an active company skill from an active category.");
+        //                }
+        //            }
+
+        //            // Empty selection means all templates; no mapping rows are inserted.
+        //            if (templateIds.Count > 0)
+        //            {
+        //                var validTemplateCount = await _context.RoleTemplates
+        //                    .AsNoTracking()
+        //                    .CountAsync(x =>
+        //                        x.CompanyId == request.CompanyId &&
+        //                        templateIds.Contains(x.TemplateId) &&
+        //                        x.IsActive == true);
+
+        //                if (validTemplateCount != templateIds.Count)
+        //                {
+        //                    return Fail(
+        //                        400,
+        //                        "Select active templates belonging to this company.");
+        //                }
+        //            }
+
+        //            var employeeIds = request.Members
+        //                .Select(x => x.EmployeeId)
+        //                .ToList();
+
+        //            var employees = await _context.EmployeeMasters
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    employeeIds.Contains(x.EmployeeId))
+        //                .Select(x => new
+        //                {
+        //                    x.EmployeeId,
+        //                    x.IsActive
+        //                })
+        //                .ToDictionaryAsync(x => x.EmployeeId);
+
+        //            if (employees.Count != employeeIds.Count)
+        //            {
+        //                return Fail(
+        //                    400,
+        //                    "One or more employees do not belong to this company.");
+        //            }
+
+        //            foreach (var member in request.Members)
+        //            {
+        //                if (member.IsActive &&
+        //                    employees[member.EmployeeId].IsActive != true)
+        //                {
+        //                    return Fail(
+        //                        400,
+        //                        $"Employee {member.EmployeeId} is inactive and cannot be an active team member.");
+        //                }
+        //            }
+
+        //            var roleIds = request.Members
+        //                .Where(x => x.RoleId.HasValue)
+        //                .Select(x => x.RoleId!.Value)
+        //                .Distinct()
+        //                .ToList();
+
+        //            if (roleIds.Count > 0)
+        //            {
+        //                var roles = await _context.Roles
+        //                    .AsNoTracking()
+        //                    .Where(x =>
+        //                        x.CompanyId == request.CompanyId &&
+        //                        roleIds.Contains(x.RoleId))
+        //                    .Select(x => new
+        //                    {
+        //                        x.RoleId,
+        //                        x.IsActive
+        //                    })
+        //                    .ToDictionaryAsync(x => x.RoleId);
+
+        //                if (roles.Count != roleIds.Count)
+        //                {
+        //                    return Fail(
+        //                        400,
+        //                        "One or more roles do not belong to this company.");
+        //                }
+
+        //                foreach (var member in request.Members)
+        //                {
+        //                    if (member.IsActive &&
+        //                        member.RoleId.HasValue &&
+        //                        roles[member.RoleId.Value].IsActive != true)
+        //                    {
+        //                        return Fail(
+        //                            400,
+        //                            $"Role {member.RoleId.Value} is inactive.");
+        //                    }
+        //                }
+        //            }
+
+        //            var now = DateTime.UtcNow;
+
+        //            team.TeamName = teamName;
+        //            team.CompanySkillMasterId = skillId;
+        //            team.IsActive = request.IsActive;
+
+        //            if (isNew)
+        //            {
+        //                team.CreatedBy = admin.EmployeeId;
+        //                team.CreatedOn = now;
+
+        //                _context.OnboardingTeams.Add(team);
+        //            }
+        //            else
+        //            {
+        //                team.ModifiedBy = admin.EmployeeId;
+        //                team.ModifiedOn = now;
+        //            }
+
+        //            // Generate the team ID before inserting related rows.
+        //            await _context.SaveChangesAsync();
+
+        //            var existingMembers = await _context.OnboardingTeamMembers
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.OnboardingTeamId == team.OnboardingTeamId)
+        //                .ToListAsync();
+
+        //            var existingMembersByEmployee = existingMembers
+        //                .ToDictionary(x => x.EmployeeId);
+
+        //            var submittedEmployeeIds = employeeIds.ToHashSet();
+
+        //            // Full replacement semantics:
+        //            // omitted members are deactivated, not deleted.
+        //            foreach (var existingMember in existingMembers)
+        //            {
+        //                if (!submittedEmployeeIds.Contains(existingMember.EmployeeId) &&
+        //                    existingMember.IsActive)
+        //                {
+        //                    existingMember.IsActive = false;
+        //                    existingMember.ModifiedBy = admin.EmployeeId;
+        //                    existingMember.ModifiedOn = now;
+        //                }
+        //            }
+
+        //            foreach (var member in request.Members)
+        //            {
+        //                if (existingMembersByEmployee.TryGetValue(
+        //                    member.EmployeeId, out var existingMember))
+        //                {
+        //                    existingMember.RoleId = member.RoleId;
+        //                    existingMember.IsActive = member.IsActive;
+        //                    existingMember.ModifiedBy = admin.EmployeeId;
+        //                    existingMember.ModifiedOn = now;
+        //                }
+        //                else
+        //                {
+        //                    _context.OnboardingTeamMembers.Add(
+        //                        new OnboardingTeamMembers
+        //                        {
+        //                            CompanyId = request.CompanyId,
+        //                            OnboardingTeamId = team.OnboardingTeamId,
+        //                            EmployeeId = member.EmployeeId,
+        //                            RoleId = member.RoleId,
+        //                            IsActive = member.IsActive,
+        //                            CreatedBy = admin.EmployeeId,
+        //                            CreatedOn = now
+        //                        });
+        //                }
+        //            }
+
+        //            var existingTemplates = await _context.OnboardingTeamTemplates
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.OnboardingTeamId == team.OnboardingTeamId)
+        //                .ToListAsync();
+
+        //            var selectedTemplateIds = templateIds.ToHashSet();
+
+        //            // Remove only mappings no longer selected.
+        //            var removedTemplates = existingTemplates
+        //                .Where(x => !selectedTemplateIds.Contains(x.TemplateId))
+        //                .ToList();
+
+        //            _context.OnboardingTeamTemplates.RemoveRange(removedTemplates);
+
+        //            var existingTemplateIds = existingTemplates
+        //                .Select(x => x.TemplateId)
+        //                .ToHashSet();
+
+        //            foreach (var templateId in templateIds)
+        //            {
+        //                if (!existingTemplateIds.Contains(templateId))
+        //                {
+        //                    _context.OnboardingTeamTemplates.Add(
+        //                        new OnboardingTeamTemplate
+        //                        {
+        //                            CompanyId = request.CompanyId,
+        //                            OnboardingTeamId = team.OnboardingTeamId,
+        //                            TemplateId = templateId,
+        //                            CreatedBy = admin.EmployeeId,
+        //                            CreatedOn = now
+        //                        });
+        //                }
+        //            }
+
+        //            await _context.SaveChangesAsync();
+
+        //            var savedMembers = await _context.OnboardingTeamMembers
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.OnboardingTeamId == team.OnboardingTeamId)
+        //                .OrderBy(x => x.EmployeeId)
+        //                .Select(x => new
+        //                {
+        //                    x.OnboardingTeamMemberId,
+        //                    x.EmployeeId,
+        //                    x.RoleId,
+        //                    x.IsActive,
+        //                    x.CreatedOn,
+        //                    x.CreatedBy,
+        //                    x.ModifiedOn,
+        //                    x.ModifiedBy
+        //                })
+        //                .ToListAsync();
+
+        //            await transaction.CommitAsync();
+
+        //            return Ok(new
+        //            {
+        //                Status = true,
+        //                Message = isNew
+        //                    ? "Onboarding team created successfully."
+        //                    : "Onboarding team updated successfully.",
+
+        //                Data = new
+        //                {
+        //                    team.OnboardingTeamId,
+        //                    team.CompanyId,
+        //                    team.TeamName,
+        //                    team.CompanySkillMasterId,
+        //                    team.IsActive,
+
+        //                    AllTemplates = templateIds.Count == 0,
+        //                    TemplateIds = templateIds.OrderBy(x => x).ToList(),
+
+        //                    ActiveMemberCount = savedMembers.Count(x => x.IsActive),
+        //                    Members = savedMembers,
+
+        //                    team.CreatedOn,
+        //                    team.CreatedBy,
+        //                    team.ModifiedOn,
+        //                    team.ModifiedBy
+        //                }
+        //            });
+        //        }
+        //        catch (DbUpdateException ex)
+        //            when (ex.InnerException is SqlException sql &&
+        //                  (sql.Number == 2601 || sql.Number == 2627))
+        //        {
+        //            Serilog.Log.Warning(
+        //                ex,
+        //                "Duplicate onboarding team or mapping for CompanyId {CompanyId}.",
+        //                request.CompanyId);
+
+        //            return Fail(
+        //                409,
+        //                "A duplicate team name, member, or template mapping already exists.");
+        //        }
+        //        catch (DbUpdateException ex)
+        //            when (ex.InnerException is SqlException sql &&
+        //                  sql.Number == 547)
+        //        {
+        //            Serilog.Log.Warning(
+        //                ex,
+        //                "Invalid onboarding relationship for CompanyId {CompanyId}.",
+        //                request.CompanyId);
+
+        //            return Fail(
+        //                409,
+        //                "A related record is invalid or has changed. Refresh and try again.");
+        //        }
+        //        catch (Exception ex)
+        //        {
+        //            Serilog.Log.Error(
+        //                ex,
+        //                "Failed to save onboarding team {TeamId} for CompanyId {CompanyId}.",
+        //                request.OnboardingTeamId,
+        //                request.CompanyId);
+
+        //            return Fail(500, "Unable to save onboarding team.");
+        //        }
+        //    }
+
+
+        //    [HttpPost("GetOnboardingTeamList")]
+        //    public async Task<IActionResult> GetOnboardingTeamList(
+        //[FromBody] GetOnboardingTeamListRequest? request)
+        //    {
+        //        IActionResult Fail(int code, string message)
+        //        {
+        //            return StatusCode(code, new
+        //            {
+        //                Status = false,
+        //                Message = message
+        //            });
+        //        }
+
+        //        if (request == null ||
+        //            request.CompanyId <= 0 ||
+        //            request.UserId <= 0)
+        //        {
+        //            return Fail(400, "Valid CompanyId and UserId are required.");
+        //        }
+
+        //        try
+        //        {
+        //            var user = await _context.EmployeeMasters
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.EmployeeId == request.UserId)
+        //                .Select(x => new
+        //                {
+        //                    x.EmployeeId,
+        //                    x.IsAdmin,
+        //                    x.IsActive
+        //                })
+        //                .FirstOrDefaultAsync();
+
+        //            if (user == null)
+        //                return Fail(404, "User not found for this company.");
+
+        //            if (user.IsActive != true)
+        //                return Fail(403, "User is inactive.");
+
+        //            bool isAdmin = user.IsAdmin == true;
+
+        //            var teamsQuery = _context.OnboardingTeams
+        //                .AsNoTracking()
+        //                .Where(x => x.CompanyId == request.CompanyId);
+
+        //            if (!isAdmin)
+        //            {
+        //                teamsQuery = teamsQuery.Where(team =>
+        //                    team.IsActive &&
+        //                    _context.OnboardingTeamMembers.Any(member =>
+        //                        member.CompanyId == team.CompanyId &&
+        //                        member.OnboardingTeamId == team.OnboardingTeamId &&
+        //                        member.EmployeeId == request.UserId &&
+        //                        member.IsActive));
+        //            }
+
+        //            var teams = await teamsQuery
+        //                .OrderByDescending(x => x.OnboardingTeamId)
+        //                .ToListAsync();
+
+        //            var teamIds = teams
+        //                .Select(x => x.OnboardingTeamId)
+        //                .ToArray();
+
+        //            var membersQuery = _context.OnboardingTeamMembers
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    teamIds.Contains(x.OnboardingTeamId));
+
+        //            // Admin can see inactive memberships for management.
+        //            if (!isAdmin)
+        //                membersQuery = membersQuery.Where(x => x.IsActive);
+
+        //            var members = await membersQuery
+        //                .OrderBy(x => x.EmployeeId)
+        //                .ToListAsync();
+
+        //            // Keep all saved template restrictions, even if a template
+        //            // later becomes inactive. Do not interpret that as "all templates".
+        //            var templateMappings = await _context.OnboardingTeamTemplates
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    teamIds.Contains(x.OnboardingTeamId))
+        //                .ToListAsync();
+
+        //            var templateIds = templateMappings
+        //                .Select(x => x.TemplateId)
+        //                .Distinct()
+        //                .ToArray();
+
+        //            var templates = await _context.RoleTemplates
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    templateIds.Contains(x.TemplateId))
+        //                .Select(x => new
+        //                {
+        //                    x.TemplateId,
+        //                    x.TemplateName,
+        //                    x.IsActive
+        //                })
+        //                .ToDictionaryAsync(x => x.TemplateId);
+
+        //            var skillIds = teams
+        //                .Where(x => x.CompanySkillMasterId.HasValue)
+        //                .Select(x => x.CompanySkillMasterId!.Value)
+        //                .Distinct()
+        //                .ToArray();
+
+        //            var skills = await _context.CompanySkillMasters
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    skillIds.Contains(x.CompanySkillMasterId))
+        //                .Select(x => new
+        //                {
+        //                    x.CompanySkillMasterId,
+        //                    x.SkillName,
+        //                    x.IsActive,
+        //                    x.IsDisable
+        //                })
+        //                .ToDictionaryAsync(x => x.CompanySkillMasterId);
+
+        //            var roleIds = members
+        //                .Where(x => x.RoleId.HasValue)
+        //                .Select(x => x.RoleId!.Value)
+        //                .Distinct()
+        //                .ToArray();
+
+        //            var roles = await _context.Roles
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    roleIds.Contains(x.RoleId))
+        //                .Select(x => new
+        //                {
+        //                    x.RoleId,
+        //                    x.RoleName,
+        //                    x.IsActive
+        //                })
+        //                .ToDictionaryAsync(x => x.RoleId);
+
+        //            var employeeIds = members
+        //                .Select(x => (int?)x.EmployeeId)
+        //                .Concat(teams.SelectMany(x => new int?[]
+        //                {
+        //            x.CreatedBy,
+        //            x.ModifiedBy
+        //                }))
+        //                .Concat(members.SelectMany(x => new int?[]
+        //                {
+        //            x.CreatedBy,
+        //            x.ModifiedBy
+        //                }))
+        //                .Where(x => x.HasValue)
+        //                .Select(x => x!.Value)
+        //                .Distinct()
+        //                .ToArray();
+
+        //            var employees = await _context.EmployeeMasters
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    employeeIds.Contains(x.EmployeeId))
+        //                .Select(x => new
+        //                {
+        //                    x.EmployeeId,
+        //                    EmployeeName =
+        //                        ((x.FirstName ?? "") + " " +
+        //                         (x.LastName ?? "")).Trim(),
+        //                    x.IsActive
+        //                })
+        //                .ToDictionaryAsync(x => x.EmployeeId);
+
+        //            string? GetEmployeeName(int? employeeId)
+        //            {
+        //                return employeeId.HasValue &&
+        //                       employees.TryGetValue(employeeId.Value, out var employee)
+        //                    ? employee.EmployeeName
+        //                    : null;
+        //            }
+
+        //            var membersByTeam = members.ToLookup(
+        //                x => x.OnboardingTeamId);
+
+        //            var templatesByTeam = templateMappings.ToLookup(
+        //                x => x.OnboardingTeamId);
+
+        //            var data = teams.Select(team =>
+        //            {
+        //                var teamMembers = membersByTeam[team.OnboardingTeamId]
+        //                    .ToList();
+
+        //                var teamTemplates = templatesByTeam[team.OnboardingTeamId]
+        //                    .OrderBy(x => x.TemplateId)
+        //                    .ToList();
+
+        //                var skill = team.CompanySkillMasterId.HasValue &&
+        //                            skills.TryGetValue(
+        //                                team.CompanySkillMasterId.Value,
+        //                                out var matchedSkill)
+        //                    ? matchedSkill
+        //                    : null;
+
+        //                return new
+        //                {
+        //                    team.OnboardingTeamId,
+        //                    team.CompanyId,
+        //                    team.TeamName,
+
+        //                    team.CompanySkillMasterId,
+        //                    SkillName = skill?.SkillName,
+        //                    SkillIsActive = skill?.IsActive,
+        //                    SkillIsDisable = skill?.IsDisable,
+
+        //                    team.IsActive,
+
+        //                    AllTemplates = teamTemplates.Count == 0,
+
+        //                    TemplateIds = teamTemplates
+        //                        .Select(x => x.TemplateId)
+        //                        .ToList(),
+
+        //                    Templates = teamTemplates.Select(mapping =>
+        //                    {
+        //                        templates.TryGetValue(
+        //                            mapping.TemplateId, out var template);
+
+        //                        return new
+        //                        {
+        //                            mapping.OnboardingTeamTemplateId,
+        //                            mapping.TemplateId,
+        //                            TemplateName = template?.TemplateName,
+        //                            IsActive = template?.IsActive,
+        //                            mapping.CreatedOn,
+        //                            mapping.CreatedBy
+        //                        };
+        //                    }).ToList(),
+
+        //                    MemberCount = teamMembers.Count,
+
+        //                    // Membership flag only.
+        //                    ActiveMemberCount = teamMembers.Count(x => x.IsActive),
+
+        //                    Members = teamMembers.Select(member =>
+        //                    {
+        //                        employees.TryGetValue(
+        //                            member.EmployeeId, out var employee);
+
+        //                        var role = member.RoleId.HasValue &&
+        //                                   roles.TryGetValue(
+        //                                       member.RoleId.Value, out var matchedRole)
+        //                            ? matchedRole
+        //                            : null;
+
+        //                        return new
+        //                        {
+        //                            member.OnboardingTeamMemberId,
+        //                            member.EmployeeId,
+        //                            EmployeeName = employee?.EmployeeName,
+        //                            EmployeeIsActive = employee?.IsActive,
+
+        //                            member.RoleId,
+        //                            RoleName = role?.RoleName,
+        //                            RoleIsActive = role?.IsActive,
+
+        //                            member.IsActive,
+
+        //                            member.CreatedOn,
+        //                            member.CreatedBy,
+        //                            CreatedByName = GetEmployeeName(member.CreatedBy),
+
+        //                            member.ModifiedOn,
+        //                            member.ModifiedBy,
+        //                            ModifiedByName = GetEmployeeName(member.ModifiedBy)
+        //                        };
+        //                    }).ToList(),
+
+        //                    team.CreatedOn,
+        //                    team.CreatedBy,
+        //                    CreatedByName = GetEmployeeName(team.CreatedBy),
+
+        //                    team.ModifiedOn,
+        //                    team.ModifiedBy,
+        //                    ModifiedByName = GetEmployeeName(team.ModifiedBy)
+        //                };
+        //            }).ToList();
+
+        //            return Ok(new
+        //            {
+        //                Status = true,
+        //                Message = data.Count > 0
+        //                    ? "Onboarding teams fetched successfully."
+        //                    : "No onboarding teams found.",
+
+        //                request.CompanyId,
+        //                request.UserId,
+        //                IsAdmin = isAdmin,
+
+        //                TotalCount = data.Count,
+        //                Data = data
+        //            });
+        //        }
+        //        catch (Exception ex)
+        //        {
+        //            Serilog.Log.Error(
+        //                ex,
+        //                "Failed to fetch onboarding teams for CompanyId {CompanyId}, UserId {UserId}.",
+        //                request.CompanyId,
+        //                request.UserId);
+
+        //            return Fail(500, "Unable to fetch onboarding teams.");
+        //        }
+        //    }
 
 
 
 
 
 
-// Place this DTO outside your controller.
-public class GetOnboardingCandidateListRequest
+
+
+        // Place this DTO outside your controller.
+        public class GetOnboardingCandidateListRequest
     {
-        public int CompanyId { get; set; }
-        public int UserId { get; set; }
-        public List<int>? BranchIds { get; set; }
-        public List<int>? DepartmentIds { get; set; }
-}
+            public int CompanyId { get; set; }
+            public int UserId { get; set; }
+            public List<int>? BranchIds { get; set; }
+            public List<int>? DepartmentIds { get; set; }
+            public List<int>? JobDescriptionIds { get; set; }
+            public string? Search { get; set; }
+            public string? Status { get; set; }
+            public DateTime? JoiningFrom { get; set; }
+            public DateTime? JoiningTo { get; set; }
+        }
 
-// Place the following method INSIDE your existing controller.
-// Uses your existing _context and entity DbSets.
-[HttpPost("GetOnboardingCandidateList")]
+        // Place the following method INSIDE your existing controller.
+        // Uses your existing _context and entity DbSets.
+        ////[HttpPost("GetOnboardingCandidateList")]
+        ////        public async Task<IActionResult> GetOnboardingCandidateList(
+        ////    [FromBody] GetOnboardingCandidateListRequest? request)
+        ////        {
+        ////            IActionResult Fail(int code, string message) =>
+        ////                StatusCode(code, new { Status = false, Message = message });
+
+        ////            if (request == null || request.CompanyId <= 0 || request.UserId <= 0)
+        ////                return Fail(400, "Valid CompanyId and UserId are required.");
+
+        ////            if (request.BranchIds?.Any(x => x < 0) == true ||
+        ////                request.DepartmentIds?.Any(x => x < 0) == true)
+        ////                return Fail(400, "Filter IDs cannot be negative.");
+
+        ////            static int[] FilterIds(List<int>? ids) =>
+        ////                ids == null || ids.Count == 0 || ids.Contains(0)
+        ////                    ? Array.Empty<int>()
+        ////                    : ids.Distinct().ToArray();
+
+        ////            static bool IsDecision(string? action) =>
+        ////                action == "Approve" || action == "Reject" || action == "Return";
+
+        ////            try
+        ////            {
+        ////                var user = await _context.EmployeeMasters.AsNoTracking()
+        ////                    .Where(x => x.CompanyId == request.CompanyId &&
+        ////                                x.EmployeeId == request.UserId)
+        ////                    .Select(x => new { x.EmployeeId, x.IsAdmin, x.IsActive })
+        ////                    .FirstOrDefaultAsync();
+
+        ////                if (user == null) return Fail(404, "User not found for this company.");
+        ////                if (user.IsActive != true) return Fail(403, "User is inactive.");
+
+        ////                bool isAdmin = user.IsAdmin == true;
+        ////                bool allTemplates = isAdmin;
+        ////                var allowedTemplateIds = new HashSet<int>();
+
+        ////                if (!isAdmin)
+        ////                {
+        ////                    var teamIds = await (
+        ////                        from member in _context.OnboardingTeamMembers.AsNoTracking()
+        ////                        join team in _context.OnboardingTeams.AsNoTracking()
+        ////                            on new { member.CompanyId, member.OnboardingTeamId }
+        ////                            equals new { team.CompanyId, team.OnboardingTeamId }
+        ////                        where member.CompanyId == request.CompanyId &&
+        ////                              member.EmployeeId == request.UserId &&
+        ////                              member.IsActive && team.IsActive
+        ////                        select team.OnboardingTeamId
+        ////                    ).Distinct().ToListAsync();
+
+        ////                    if (teamIds.Count == 0)
+        ////                        return Fail(403, "An active onboarding team assignment is required.");
+
+        ////                    // Read every mapping, including references to inactive templates.
+        ////                    // Missing/invalid targets must never broaden access to all templates.
+        ////                    var scopes = await _context.OnboardingTeamTemplates.AsNoTracking()
+        ////                        .Where(x => x.CompanyId == request.CompanyId &&
+        ////                                    teamIds.Contains(x.OnboardingTeamId))
+        ////                        .Select(x => new { x.OnboardingTeamId, x.TemplateId })
+        ////                        .ToListAsync();
+
+        ////                    var restrictedTeams = scopes.Select(x => x.OnboardingTeamId).ToHashSet();
+        ////                    allTemplates = teamIds.Any(id => !restrictedTeams.Contains(id));
+        ////                    allowedTemplateIds = scopes.Select(x => x.TemplateId).ToHashSet();
+        ////                }
+
+        ////                var branchIds = FilterIds(request.BranchIds);
+        ////                var departmentIds = FilterIds(request.DepartmentIds);
+        ////                var allowedIds = allowedTemplateIds.ToArray();
+
+        ////                var query =
+        ////                    from application in _context.CandidateApplications.AsNoTracking()
+        ////                    join candidate in _context.Candidates.AsNoTracking()
+        ////                        on new { application.CompanyId, application.CandidateId }
+        ////                        equals new { candidate.CompanyId, candidate.CandidateId }
+        ////                    join job in _context.JobDescriptions.AsNoTracking()
+        ////                        on new { application.CompanyId, application.JobDescriptionId }
+        ////                        equals new { job.CompanyId, job.JobDescriptionId }
+        ////                    join template in _context.RoleTemplates.AsNoTracking()
+        ////                        on new { job.CompanyId, TemplateId = (int?)job.TemplateId }
+        ////                        equals new { template.CompanyId, TemplateId = (int?)template.TemplateId }
+        ////                    where application.CompanyId == request.CompanyId &&
+        ////                          application.IsActive == true &&
+        ////                          candidate.IsActive == true &&
+        ////                          template.IsActive == true
+        ////                    select new
+        ////                    {
+        ////                        Application = application,
+        ////                        Candidate = candidate,
+        ////                        job.JobTitle,
+        ////                        template.TemplateId,
+        ////                        template.TemplateName
+        ////                    };
+
+        ////                if (!allTemplates)
+        ////                    query = query.Where(x => allowedIds.Contains(x.TemplateId));
+
+        ////                if (branchIds.Length > 0)
+        ////                    query = query.Where(x => x.Application.BranchId.HasValue &&
+        ////                        branchIds.Contains(x.Application.BranchId.Value));
+
+        ////                if (departmentIds.Length > 0)
+        ////                    query = query.Where(x => x.Application.DepartmentId.HasValue &&
+        ////                        departmentIds.Contains(x.Application.DepartmentId.Value));
+
+        ////                var rows = await query
+        ////                    .OrderByDescending(x => x.Application.CandidateApplicationId)
+        ////                    .ToListAsync();
+
+        ////                var applicationIds = rows.Select(x => x.Application.CandidateApplicationId)
+        ////                    .Distinct().ToArray();
+        ////                var templateIds = rows.Select(x => x.TemplateId).Distinct().ToArray();
+
+        ////                var assignments = await _context.RoleTemplateAssignment.AsNoTracking()
+        ////                    .Where(x => x.CompanyId == request.CompanyId &&
+        ////                                templateIds.Contains(x.TemplateId) &&
+        ////                                x.IsActive == true &&
+        ////                                x.CanApprove == true)
+        ////                    .Select(x => new
+        ////                    {
+        ////                        x.AssignmentId,
+        ////                        x.TemplateId,
+        ////                        x.EmployeeId,
+        ////                        x.HierarchyLevel
+        ////                    })
+        ////                    .ToListAsync();
+
+        ////                var assignmentIds = assignments.Select(x => x.AssignmentId).ToArray();
+
+        ////                var decisions = await _context.CandidateSkillAssessmentHistories
+        ////                    .AsNoTracking()
+        ////                    .Where(x => x.CompanyId == request.CompanyId &&
+        ////                                applicationIds.Contains(x.CandidateApplicationId) &&
+        ////                                x.AssignmentId.HasValue &&
+        ////                                assignmentIds.Contains(x.AssignmentId.Value) &&
+        ////                                (x.Action == "Approve" ||
+        ////                                 x.Action == "Reject" ||
+        ////                                 x.Action == "Return"))
+        ////                    .ToListAsync();
+
+        ////                // Group per application, job and assignment. Author must be the assigned
+        ////                // employee; an admin action under someone else's assignment does not
+        ////                // stand in for that employee's approval.
+        ////                var decisionsByAssignment = decisions.ToLookup(x => (
+        ////                    x.CandidateApplicationId, x.JobDescriptionId, x.AssignmentId!.Value));
+
+        ////                var assignmentsByTemplate = assignments.ToLookup(x => x.TemplateId);
+
+        ////                var eligibleRows = rows.Where(row =>
+        ////                {
+        ////                    var required = assignmentsByTemplate[row.TemplateId].ToList();
+        ////                    if (required.Count == 0) return false;
+
+        ////                    return required.All(assignment =>
+        ////                    {
+        ////                        var latest = decisionsByAssignment[(
+        ////                            row.Application.CandidateApplicationId,
+        ////                            row.Application.JobDescriptionId,
+        ////                            assignment.AssignmentId)]
+        ////                            .Where(x => x.CreatedBy == assignment.EmployeeId &&
+        ////                                        IsDecision(x.Action))
+        ////                            .OrderByDescending(x => x.CreatedOn)
+        ////                            .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+        ////                            .FirstOrDefault();
+
+        ////                        return latest?.Action == "Approve";
+        ////                    });
+        ////                }).ToList();
+
+        ////                var eligibleApplicationIds = eligibleRows
+        ////                    .Select(x => x.Application.CandidateApplicationId).ToArray();
+
+        ////                // Includes completed/closed onboarding records for dashboard outcomes.
+        ////                var onboardings = await _context.CandidateOnboardings.AsNoTracking()
+        ////                    .Where(x => x.CompanyId == request.CompanyId &&
+        ////                                eligibleApplicationIds.Contains(x.CandidateApplicationId))
+        ////                    .ToListAsync();
+
+        ////                var onboardingByApplication = onboardings.ToDictionary(
+        ////                    x => x.CandidateApplicationId);
+
+        ////                var onboardingIds = onboardings.Select(x => x.CandidateOnboardingId).ToArray();
+
+        ////                var documents = await _context.CandidateOnboardingDocuments.AsNoTracking()
+        ////                    .Where(x => x.CompanyId == request.CompanyId &&
+        ////                                onboardingIds.Contains(x.CandidateOnboardingId) &&
+        ////                                x.IsActive)
+        ////                    .ToListAsync();
+
+        ////                var policies = await _context.CandidateOnboardingPolicies.AsNoTracking()
+        ////                    .Where(x => x.CompanyId == request.CompanyId &&
+        ////                                onboardingIds.Contains(x.CandidateOnboardingId) &&
+        ////                                x.IsActive)
+        ////                    .ToListAsync();
+
+        ////                var offers = await _context.CandidateOnboardingOffers.AsNoTracking()
+        ////                    .Where(x => x.CompanyId == request.CompanyId &&
+        ////                                onboardingIds.Contains(x.CandidateOnboardingId) &&
+        ////                                x.IsCurrent)
+        ////                    .ToListAsync();
+
+        ////                var docsByOnboarding = documents.ToLookup(x => x.CandidateOnboardingId);
+        ////                var policiesByOnboarding = policies.ToLookup(x => x.CandidateOnboardingId);
+        ////                // A unique filtered index should enforce one current offer.
+        ////                var offersByOnboarding = offers.ToLookup(x => x.CandidateOnboardingId);
+
+        ////                var resultBranchIds = eligibleRows
+        ////                    .Where(x => x.Application.BranchId.HasValue)
+        ////                    .Select(x => x.Application.BranchId!.Value).Distinct().ToArray();
+        ////                var resultDepartmentIds = eligibleRows
+        ////                    .Where(x => x.Application.DepartmentId.HasValue)
+        ////                    .Select(x => x.Application.DepartmentId!.Value).Distinct().ToArray();
+
+        ////                var branches = await _context.Branches.AsNoTracking()
+        ////                    .Where(x => x.CompanyId == request.CompanyId &&
+        ////                                resultBranchIds.Contains(x.BranchId))
+        ////                    .ToDictionaryAsync(x => x.BranchId, x => x.BranchName);
+
+        ////                var departments = await _context.Departments.AsNoTracking()
+        ////                    .Where(x => x.CompanyId == request.CompanyId &&
+        ////                                resultDepartmentIds.Contains(x.DepartmentId))
+        ////                    .ToDictionaryAsync(x => x.DepartmentId, x => x.DepartmentName);
+
+        ////                var data = eligibleRows.Select(row =>
+        ////                {
+        ////                    var application = row.Application;
+        ////                    var candidate = row.Candidate;
+        ////                    onboardingByApplication.TryGetValue(
+        ////                        application.CandidateApplicationId, out var onboarding);
+
+        ////                    int onboardingId = onboarding?.CandidateOnboardingId ?? 0;
+        ////                    var docs = docsByOnboarding[onboardingId].ToList();
+        ////                    var candidatePolicies = policiesByOnboarding[onboardingId].ToList();
+        ////                    var currentOffer = offersByOnboarding[onboardingId]
+        ////                        .OrderByDescending(x => x.VersionNumber)
+        ////                        .ThenByDescending(x => x.CandidateOnboardingOfferId)
+        ////                        .FirstOrDefault();
+
+        ////                    int submittedCount = docs.Count(x =>
+        ////                        x.Status == "Submitted" || x.Status == "Verified");
+        ////                    int verifiedCount = docs.Count(x => x.Status == "Verified");
+        ////                    int mandatoryCount = docs.Count(x => x.IsMandatory);
+
+        ////                    // No document requests must not imply verification is complete.
+        ////                    // If only optional requests exist, require all of them verified
+        ////                    // for this dashboard's "Verified Candidates" classification.
+        ////                    bool documentsVerified = docs.Count > 0 &&
+        ////                        (mandatoryCount > 0
+        ////                            ? docs.Where(x => x.IsMandatory).All(x => x.Status == "Verified")
+        ////                            : docs.All(x => x.Status == "Verified"));
+
+        ////                    string policyStatus = candidatePolicies.Count == 0
+        ////                        ? "NotSent"
+        ////                        : candidatePolicies.Any(x => x.IsAcknowledged == false)
+        ////                            ? "Declined"
+        ////                            : candidatePolicies.All(x => x.IsAcknowledged == true)
+        ////                                ? "Acknowledged"
+        ////                                : candidatePolicies.Any(x => x.SharedOn.HasValue)
+        ////                                    ? "AwaitingAcknowledgment"
+        ////                                    : "NotSent";
+
+        ////                    bool joined = onboarding?.FinalOutcome == "Joined";
+        ////                    bool closed = joined ||
+        ////                        onboarding?.FinalOutcome == "Rejected" ||
+        ////                        onboarding?.FinalOutcome == "OfferDeclined";
+
+        ////                    bool activeOnboarding = onboarding == null || onboarding.IsActive;
+
+        ////                    string? branchName = null;
+        ////                    string? departmentName = null;
+        ////                    if (application.BranchId.HasValue)
+        ////                        branches.TryGetValue(application.BranchId.Value, out branchName);
+        ////                    if (application.DepartmentId.HasValue)
+        ////                        departments.TryGetValue(application.DepartmentId.Value, out departmentName);
+
+        ////                    return new
+        ////                    {
+        ////                        application.CompanyId,
+        ////                        candidate.CandidateId,
+        ////                        application.CandidateApplicationId,
+        ////                        application.JobDescriptionId,
+        ////                        row.JobTitle,
+        ////                        row.TemplateId,
+        ////                        row.TemplateName,
+
+        ////                        CandidateName = string.Join(" ", new[]
+        ////                        {
+        ////                    candidate.FirstName, candidate.MiddleName, candidate.LastName
+        ////                }.Where(x => !string.IsNullOrWhiteSpace(x))),
+        ////                        candidate.Email,
+        ////                        candidate.MobileNumber,
+
+        ////                        application.BranchId,
+        ////                        BranchName = branchName,
+        ////                        application.DepartmentId,
+        ////                        DepartmentName = departmentName,
+
+        ////                        CandidateOnboardingId = (int?)onboarding?.CandidateOnboardingId,
+        ////                        OnboardingStatus = onboarding?.Status ?? "ReadyForOnboarding",
+        ////                        OnboardingIsActive = activeOnboarding,
+        ////                        AllHierarchyApproved = true,
+        ////                        RequiredApprovalCount = assignmentsByTemplate[row.TemplateId].Count(),
+
+        ////                        // Eligibility/action flag, separate from completed joining.
+        ////                        IsOnBoarding = activeOnboarding && !closed,
+        ////                        IsJoined = joined,
+        ////                        IsPending = activeOnboarding && !closed,
+        ////                        IsVerified = documentsVerified,
+
+        ////                        DocumentStatus = submittedCount > 0
+        ////                            ? "Submitted" : "RequestDocuments",
+        ////                        DocumentStatusText = submittedCount > 0
+        ////                            ? "Submitted" : "Request Documents",
+        ////                        RequestedDocumentCount = docs.Count,
+        ////                        SubmittedDocumentCount = submittedCount,
+        ////                        VerifiedDocumentCount = verifiedCount,
+        ////                        MandatoryDocumentCount = mandatoryCount,
+        ////                        ResubmissionRequiredCount = docs.Count(x =>
+        ////                            x.Status == "ResubmissionRequired"),
+
+        ////                        CompanyPolicyStatus = policyStatus,
+        ////                        PolicyCount = candidatePolicies.Count,
+        ////                        AcknowledgedPolicyCount = candidatePolicies.Count(x =>
+        ////                            x.IsAcknowledged == true),
+
+        ////                        OfferStatus = currentOffer?.Status ?? "NotIssued",
+        ////                        OfferResponse = currentOffer?.CandidateResponse,
+        ////                        CandidateOnboardingOfferId =
+        ////                            (int?)currentOffer?.CandidateOnboardingOfferId,
+
+        ////                        OnboardedStatus = joined ? "Joined"
+        ////                            : onboarding?.FinalOutcome ?? "NotYet",
+
+        ////                        ExpectedJoiningDate = onboarding?.ExpectedJoiningDate
+        ////                            ?? currentOffer?.ExpectedJoiningDate,
+        ////                        ActualJoiningDate = onboarding?.ActualJoiningDate,
+        ////                        FinalOutcome = onboarding?.FinalOutcome,
+        ////                        OutcomeRemarks = onboarding?.OutcomeRemarks,
+        ////                        application.AppliedOn
+        ////                    };
+        ////                }).ToList();
+
+        ////                return Ok(new
+        ////                {
+        ////                    Status = true,
+        ////                    Message = data.Count > 0
+        ////                        ? "Onboarding candidates fetched successfully."
+        ////                        : "No fully approved candidates found within your scope.",
+        ////                    request.CompanyId,
+        ////                    request.UserId,
+        ////                    IsAdmin = isAdmin,
+        ////                    AllTemplates = allTemplates,
+        ////                    Summary = new
+        ////                    {
+        ////                        TotalCandidate = data.Count,
+        ////                        VerifiedCandidate = data.Count(x => x.IsVerified),
+        ////                        PendingCandidate = data.Count(x => x.IsPending),
+        ////                        JoinedCandidate = data.Count(x => x.IsJoined)
+        ////                    },
+        ////                    TotalCount = data.Count,
+        ////                    Data = data
+        ////                });
+        ////            }
+        ////            catch (Exception ex)
+        ////            {
+        ////                Serilog.Log.Error(ex,
+        ////                    "Failed to fetch onboarding candidates for CompanyId {CompanyId}, UserId {UserId}.",
+        ////                    request.CompanyId, request.UserId);
+        ////                return Fail(500, "Unable to fetch onboarding candidates.");
+        ////            }
+        ////        }
+
+
+
+
+
+
+
+
+
+        // DTOs go outside your controller.
+
+
+        //// Place INSIDE your existing controller.
+        //[HttpPost("SaveOnboardingDocument")]
+        //        public async Task<IActionResult> SaveOnboardingDocument([FromBody] SaveOnboardingDocumentRequest? request)
+        //        {
+        //            IActionResult Fail(int code, string message) =>
+        //                StatusCode(code, new { Status = false, Message = message });
+
+        //            if (request == null || request.CompanyId <= 0 || request.UserId <= 0 ||
+        //                request.CandidateId <= 0 || request.JobDescriptionId <= 0 ||
+        //                request.CandidateApplicationId < 0)
+        //                return Fail(400, "Provide valid company, user, candidate and job IDs.");
+
+        //            if (request.Documents == null || request.Documents.Count == 0)
+        //                return Fail(400, "At least one document request is required.");
+
+        //            foreach (var item in request.Documents)
+        //            {
+        //                if (item == null)
+        //                    return Fail(400, "Document request cannot be null.");
+        //                if (item.CandidateOnboardingDocumentId < 0)
+        //                    return Fail(400, "Invalid document ID.");
+        //                if (item.AllocatedDays <= 0 || item.AllocatedDays > 365)
+        //                    return Fail(400, "AllocatedDays must be between 1 and 365.");
+
+        //                item.DocumentName = item.DocumentName?.Trim();
+        //                item.Instructions = item.Instructions?.Trim();
+
+        //                if (string.IsNullOrWhiteSpace(item.DocumentName))
+        //                    return Fail(400, "DocumentName is required.");
+        //                if (item.DocumentName?.Length > 200)
+        //                    return Fail(400, "DocumentName cannot exceed 200 characters.");
+        //                if (item.CandidateOnboardingDocumentId > 0 &&
+        //                    (item.RowVersion == null || item.RowVersion.Length != 8))
+        //                    return Fail(400, "Send the current RowVersion when editing a document request.");
+        //            }
+
+        //            if (request.Documents.Where(x => x.CandidateOnboardingDocumentId > 0)
+        //                .GroupBy(x => x.CandidateOnboardingDocumentId).Any(g => g.Count() > 1))
+        //                return Fail(400, "A document request ID cannot repeat.");
+
+        //            try
+        //            {
+        //                await using var transaction = await _context.Database
+        //                    .BeginTransactionAsync(IsolationLevel.Serializable);
+
+        //                var user = await _context.EmployeeMasters.AsNoTracking()
+        //                    .FirstOrDefaultAsync(x => x.CompanyId == request.CompanyId &&
+        //                        x.EmployeeId == request.UserId);
+        //                if (user == null) return Fail(404, "Employee not found for this company.");
+        //                if (user.IsActive != true) return Fail(403, "Employee is inactive.");
+
+        //                var candidatesExist = await _context.Candidates.AsNoTracking()
+        //                    .AnyAsync(x => x.CompanyId == request.CompanyId &&
+        //                        x.CandidateId == request.CandidateId && x.IsActive == true);
+        //                if (!candidatesExist) return Fail(404, "Active candidate not found.");
+
+        //                var job = await _context.JobDescriptions.AsNoTracking()
+        //                    .FirstOrDefaultAsync(x => x.CompanyId == request.CompanyId &&
+        //                        x.JobDescriptionId == request.JobDescriptionId);
+        //                if (job == null) return Fail(404, "Job not found for this company.");
+
+        //                int? templateId = job.TemplateId;
+        //                if (!templateId.HasValue || !await _context.RoleTemplates.AsNoTracking()
+        //                    .AnyAsync(x => x.CompanyId == request.CompanyId &&
+        //                        x.TemplateId == templateId.Value && x.IsActive == true))
+        //                    return Fail(409, "The job must have an active recruitment template.");
+
+        //                var applicationsQuery = _context.CandidateApplications.Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.CandidateId == request.CandidateId &&
+        //                    x.JobDescriptionId == request.JobDescriptionId);
+        //                if (request.CandidateApplicationId > 0)
+        //                    applicationsQuery = applicationsQuery.Where(x =>
+        //                        x.CandidateApplicationId == request.CandidateApplicationId);
+        //                var applications = await applicationsQuery.Take(2).ToListAsync();
+        //                if (applications.Count == 0) return Fail(404, "Candidate application not found.");
+        //                if (applications.Count > 1)
+        //                    return Fail(409, "Multiple applications exist. Send CandidateApplicationId.");
+        //                var application = applications[0];
+        //                if (application.IsActive != true)
+        //                    return Fail(409, "Candidate application is inactive.");
+
+        //                if (user.IsAdmin != true)
+        //                {
+        //                    var teamIds = await (
+        //                        from member in _context.OnboardingTeamMembers.AsNoTracking()
+        //                        join team in _context.OnboardingTeams.AsNoTracking()
+        //                            on new { member.CompanyId, member.OnboardingTeamId }
+        //                            equals new { team.CompanyId, team.OnboardingTeamId }
+        //                        where member.CompanyId == request.CompanyId &&
+        //                            member.EmployeeId == request.UserId &&
+        //                            member.IsActive && team.IsActive
+        //                        select team.OnboardingTeamId
+        //                    ).Distinct().ToListAsync();
+        //                    var scopes = await _context.OnboardingTeamTemplates.AsNoTracking()
+        //                        .Where(x => x.CompanyId == request.CompanyId &&
+        //                            teamIds.Contains(x.OnboardingTeamId)).ToListAsync();
+        //                    bool allowed = teamIds.Any(id =>
+        //                        !scopes.Any(x => x.OnboardingTeamId == id) ||
+        //                        scopes.Any(x => x.OnboardingTeamId == id &&
+        //                            x.TemplateId == templateId.Value));
+        //                    if (!allowed)
+        //                        return Fail(403, "You are not assigned to onboarding for this template.");
+        //                }
+
+        //                // Same eligibility rule as GetOnboardingCandidateList.
+        //                var assignments = await _context.RoleTemplateAssignment.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                        x.TemplateId == templateId.Value && x.IsActive == true &&
+        //                        x.CanApprove == true).ToListAsync();
+        //                if (assignments.Count == 0)
+        //                    return Fail(409, "The template has no active approval assignments.");
+
+        //                var assignmentIds = assignments.Select(x => x.AssignmentId).ToArray();
+        //                var decisions = await _context.CandidateSkillAssessmentHistories.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                        x.CandidateApplicationId == application.CandidateApplicationId &&
+        //                        x.JobDescriptionId == request.JobDescriptionId &&
+        //                        x.AssignmentId.HasValue && assignmentIds.Contains(x.AssignmentId.Value) &&
+        //                        (x.Action == "Approve" || x.Action == "Reject" || x.Action == "Return"))
+        //                    .ToListAsync();
+        //                if (assignments.Any(a =>
+        //                    decisions.Where(x => x.AssignmentId == a.AssignmentId &&
+        //                            x.CreatedBy == a.EmployeeId)
+        //                        .OrderByDescending(x => x.CreatedOn)
+        //                        .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+        //                        .FirstOrDefault()?.Action != "Approve"))
+        //                    return Fail(409, "All required hierarchy approvals must be completed.");
+
+        //                var onboarding = await _context.CandidateOnboardings
+        //                    .FirstOrDefaultAsync(x => x.CompanyId == request.CompanyId &&
+        //                        x.CandidateApplicationId == application.CandidateApplicationId);
+
+        //                if (onboarding != null &&
+        //                    (!onboarding.IsActive || !string.IsNullOrWhiteSpace(onboarding.FinalOutcome)))
+        //                    return Fail(409, "This onboarding case is inactive or already closed.");
+
+        //                // Do not reopen later completed stages by silently adding new requirements.
+        //                if (onboarding != null &&
+        //                    onboarding.Status != "ReadyForOnboarding" &&
+        //                    onboarding.Status != "DocumentsPending")
+        //                    return Fail(409, "Document requests can be changed only before advancing beyond the document stage.");
+
+        //                var existing = onboarding == null
+        //                    ? new List<CandidateOnboardingDocuments>()
+        //                    : await _context.CandidateOnboardingDocuments
+        //                        .Where(x => x.CompanyId == request.CompanyId &&
+        //                            x.CandidateOnboardingId == onboarding.CandidateOnboardingId)
+        //                        .ToListAsync();
+        //                var existingById = existing.ToDictionary(x => x.CandidateOnboardingDocumentId);
+
+        //                foreach (var item in request.Documents)
+        //                {
+        //                    CandidateOnboardingDocuments? saved = null;
+        //                    if (item.CandidateOnboardingDocumentId > 0)
+        //                    {
+        //                        if (!existingById.TryGetValue(item.CandidateOnboardingDocumentId, out saved))
+        //                            return Fail(404, "Document request not found for this onboarding case.");
+        //                        if (!saved.IsActive || saved.Status != "Requested")
+        //                            return Fail(409, "Only active, unsubmitted document requests can be edited here.");
+        //                        if (!saved.RowVersion.SequenceEqual(item.RowVersion!))
+        //                            return Fail(409, "Document request changed. Refresh and try again.");
+        //                    }
+
+
+        //                    if (string.IsNullOrWhiteSpace(item.DocumentName) || item.DocumentName.Length > 200)
+        //                        return Fail(400, "Every document must have a valid name up to 200 characters.");
+        //                }
+
+        //                // Validate the final combined selection. Omitted rows remain unchanged.
+        //                var editedIds = request.Documents.Where(x => x.CandidateOnboardingDocumentId > 0)
+        //                    .Select(x => x.CandidateOnboardingDocumentId).ToHashSet();
+        //                var finalNames = existing.Where(x => x.IsActive && !editedIds.Contains(x.CandidateOnboardingDocumentId))
+        //                    .Select(x => x.DocumentName.Trim())
+        //                    .Concat(request.Documents.Select(x => x.DocumentName!));
+        //                if (finalNames.GroupBy(x => x, StringComparer.OrdinalIgnoreCase).Any(g => g.Count() > 1))
+        //                    return Fail(409, "An active request for this document name already exists.");
+
+        //                var now = DateTime.UtcNow;
+        //                bool isNewOnboarding = onboarding == null;
+        //                if (onboarding == null)
+        //                {
+        //                    onboarding = new CandidateOnboardings
+        //                    {
+        //                        CompanyId = request.CompanyId,
+        //                        CandidateApplicationId = application.CandidateApplicationId,
+        //                        TemplateIdAtStart = templateId,
+        //                        Status = "ReadyForOnboarding",
+        //                        IsActive = true,
+        //                        CreatedBy = request.UserId,
+        //                        CreatedOn = now
+        //                    };
+        //                    _context.CandidateOnboardings.Add(onboarding);
+        //                    await _context.SaveChangesAsync();
+        //                }
+
+        //                string Snapshot(CandidateOnboardingDocuments document) =>
+        //                    JsonSerializer.Serialize(new
+        //                    {
+        //                        document.CandidateOnboardingDocumentId,
+        //                        document.OnboardingDocumentMasterId,
+        //                        document.DocumentName,
+        //                        document.IsMandatory,
+        //                        document.AllocatedDays,
+        //                        document.RequestedOn,
+        //                        document.DueOn,
+        //                        document.Instructions,
+        //                        document.Status,
+        //                        document.CurrentSubmissionNumber,
+        //                        document.ReceivedFromCandidate,
+        //                        document.IsActive
+        //                    });
+
+        //                var changes = new List<(CandidateOnboardingDocuments Document,
+        //                    string? Before, string? OldStatus, string Action)>();
+
+        //                foreach (var item in request.Documents)
+        //                {
+        //                    if (item.CandidateOnboardingDocumentId == 0)
+        //                    {
+        //                        var document = new CandidateOnboardingDocuments
+        //                        {
+        //                            CompanyId = request.CompanyId,
+        //                            CandidateOnboardingId = onboarding.CandidateOnboardingId,
+        //                            OnboardingDocumentMasterId = null,
+        //                            DocumentName = item.DocumentName!,
+        //                            IsMandatory = item.IsMandatory,
+        //                            AllocatedDays = item.AllocatedDays,
+        //                            RequestedOn = now,
+        //                            RequestedBy = request.UserId,
+        //                            DueOn = now.AddDays(item.AllocatedDays),
+        //                            Instructions = item.Instructions,
+        //                            Status = "Requested",
+        //                            CurrentSubmissionNumber = 0,
+        //                            ReceivedFromCandidate = false,
+        //                            IsActive = true,
+        //                            CreatedBy = request.UserId,
+        //                            CreatedOn = now
+        //                        };
+        //                        _context.CandidateOnboardingDocuments.Add(document);
+        //                        changes.Add((document, null, null, "DocumentRequested"));
+        //                    }
+        //                    else
+        //                    {
+        //                        var document = existingById[item.CandidateOnboardingDocumentId];
+        //                        bool daysChanged = document.AllocatedDays != item.AllocatedDays;
+        //                        bool changed = daysChanged || document.DocumentName != item.DocumentName ||
+        //                            document.IsMandatory != item.IsMandatory ||
+        //                            document.Instructions != item.Instructions;
+        //                        if (!changed) continue;
+
+        //                        string before = Snapshot(document);
+        //                        document.DocumentName = item.DocumentName!;
+        //                        document.IsMandatory = item.IsMandatory;
+        //                        document.Instructions = item.Instructions;
+        //                        if (daysChanged)
+        //                        {
+        //                            // Days are TOTAL calendar days from original request time.
+        //                            // Saving an unrelated edit never resets the due date.
+        //                            document.AllocatedDays = item.AllocatedDays;
+        //                            document.DueOn = document.RequestedOn.AddDays(item.AllocatedDays);
+        //                        }
+        //                        document.ModifiedBy = request.UserId;
+        //                        document.ModifiedOn = now;
+        //                        changes.Add((document, before, document.Status, "DocumentRequestUpdated"));
+        //                    }
+        //                }
+
+        //                if (changes.Count > 0)
+        //                {
+        //                    string oldStatus = onboarding.Status;
+        //                    onboarding.Status = "DocumentsPending";
+        //                    if (!isNewOnboarding)
+        //                    {
+        //                        onboarding.ModifiedBy = request.UserId;
+        //                        onboarding.ModifiedOn = now;
+        //                    }
+        //                    await _context.SaveChangesAsync();
+
+        //                    foreach (var change in changes)
+        //                    {
+        //                        _context.CandidateOnboardingHistories.Add(new CandidateOnboardingHistories
+        //                        {
+        //                            CompanyId = request.CompanyId,
+        //                            CandidateOnboardingId = onboarding.CandidateOnboardingId,
+        //                            CandidateOnboardingDocumentId = change.Document.CandidateOnboardingDocumentId,
+        //                            Action = change.Action,
+        //                            PreviousStatus = change.OldStatus,
+        //                            NewStatus = change.Document.Status,
+        //                            PreviousDetailsJson = change.Before,
+        //                            DetailsJson = Snapshot(change.Document),
+        //                            IsRemarkAdded = false,
+        //                            CreatedBy = request.UserId,
+        //                            CreatedOn = now
+        //                        });
+        //                    }
+        //                    if (oldStatus != onboarding.Status)
+        //                    {
+        //                        _context.CandidateOnboardingHistories.Add(new CandidateOnboardingHistories
+        //                        {
+        //                            CompanyId = request.CompanyId,
+        //                            CandidateOnboardingId = onboarding.CandidateOnboardingId,
+        //                            Action = "DocumentStageStarted",
+        //                            PreviousStatus = oldStatus,
+        //                            NewStatus = onboarding.Status,
+        //                            DetailsJson = JsonSerializer.Serialize(new { onboarding.Status }),
+        //                            CreatedBy = request.UserId,
+        //                            CreatedOn = now
+        //                        });
+        //                    }
+        //                    await _context.SaveChangesAsync();
+        //                }
+
+        //                var savedDocuments = await _context.CandidateOnboardingDocuments.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                        x.CandidateOnboardingId == onboarding.CandidateOnboardingId && x.IsActive)
+        //                    .OrderBy(x => x.CandidateOnboardingDocumentId)
+        //                    .Select(x => new
+        //                    {
+        //                        x.CandidateOnboardingDocumentId,
+        //                        x.OnboardingDocumentMasterId,
+        //                        x.DocumentName,
+        //                        x.IsMandatory,
+        //                        x.AllocatedDays,
+        //                        x.RequestedOn,
+        //                        x.RequestedBy,
+        //                        x.DueOn,
+        //                        x.Instructions,
+        //                        x.Status,
+        //                        x.CurrentSubmissionNumber,
+        //                        x.ReceivedFromCandidate,
+        //                        x.CreatedBy,
+        //                        x.CreatedOn,
+        //                        x.ModifiedBy,
+        //                        x.ModifiedOn,
+        //                        x.RowVersion
+        //                    }).ToListAsync();
+
+        //                var history = await _context.CandidateOnboardingHistories.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                        x.CandidateOnboardingId == onboarding.CandidateOnboardingId &&
+        //                        (x.Action == "DocumentRequested" || x.Action == "DocumentRequestUpdated" ||
+        //                         x.Action == "DocumentStageStarted"))
+        //                    .OrderByDescending(x => x.CreatedOn)
+        //                    .ThenByDescending(x => x.CandidateOnboardingHistoryId)
+        //                    .Select(x => new
+        //                    {
+        //                        x.CandidateOnboardingHistoryId,
+        //                        x.CandidateOnboardingDocumentId,
+        //                        x.Action,
+        //                        x.PreviousStatus,
+        //                        x.NewStatus,
+        //                        x.PreviousDetailsJson,
+        //                        x.DetailsJson,
+        //                        x.CreatedBy,
+        //                        x.CreatedOn
+        //                    }).ToListAsync();
+
+        //                await transaction.CommitAsync();
+        //                return Ok(new
+        //                {
+        //                    Status = true,
+        //                    Message = changes.Count == 0
+        //                        ? "No document request changes were found."
+        //                        : "Document requests saved successfully.",
+        //                    Data = new
+        //                    {
+        //                        onboarding.CandidateOnboardingId,
+        //                        request.CompanyId,
+        //                        request.CandidateId,
+        //                        request.JobDescriptionId,
+        //                        application.CandidateApplicationId,
+        //                        onboarding.Status,
+        //                        onboarding.RowVersion,
+        //                        ChangedDocumentCount = changes.Count,
+        //                        Documents = savedDocuments,
+        //                        History = history
+        //                    }
+        //                });
+        //            }
+        //            catch (DbUpdateConcurrencyException)
+        //            {
+        //                return Fail(409, "The record changed. Refresh the latest data and try again.");
+        //            }
+        //            catch (DbUpdateException ex) when (ex.InnerException is SqlException sql &&
+        //                (sql.Number == 2601 || sql.Number == 2627))
+        //            {
+        //                return Fail(409, "A duplicate onboarding record or document request already exists.");
+        //            }
+        //            catch (Exception ex)
+        //            {
+        //                Serilog.Log.Error(ex,
+        //                    "Failed to save onboarding document requests for CompanyId {CompanyId}, CandidateId {CandidateId}, JobId {JobId}.",
+        //                    request.CompanyId, request.CandidateId, request.JobDescriptionId);
+        //                return Fail(500, "Unable to save onboarding document requests.");
+        //            }
+        //        }
+        //        [HttpPost("GetOnboardingCandidateList")]
+        //        public async Task<IActionResult> GetOnboardingCandidateList(
+        //[FromBody] GetOnboardingCandidateListRequest? request)
+        //        {
+        //            IActionResult Fail(int code, string message) =>
+        //                StatusCode(code, new { Status = false, Message = message });
+
+        //            if (request == null || request.CompanyId <= 0 || request.UserId <= 0)
+        //                return Fail(400, "Valid CompanyId and UserId are required.");
+
+        //            if (request.BranchIds?.Any(x => x < 0) == true ||
+        //                request.DepartmentIds?.Any(x => x < 0) == true)
+        //                return Fail(400, "Filter IDs cannot be negative.");
+
+        //            static int[] FilterIds(List<int>? ids) =>
+        //                ids == null || ids.Count == 0 || ids.Contains(0)
+        //                    ? Array.Empty<int>()
+        //                    : ids.Distinct().ToArray();
+
+        //            try
+        //            {
+        //                var user = await _context.EmployeeMasters.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                x.EmployeeId == request.UserId)
+        //                    .Select(x => new { x.EmployeeId, x.IsAdmin, x.IsActive })
+        //                    .FirstOrDefaultAsync();
+
+        //                if (user == null) return Fail(404, "User not found for this company.");
+        //                if (user.IsActive != true) return Fail(403, "User is inactive.");
+
+        //                bool isAdmin = user.IsAdmin == true;
+        //                bool allTemplates = isAdmin;
+        //                var allowedTemplateIds = new HashSet<int>();
+
+        //                if (!isAdmin)
+        //                {
+        //                    var teamIds = await (
+        //                        from member in _context.OnboardingTeamMembers.AsNoTracking()
+        //                        join team in _context.OnboardingTeams.AsNoTracking()
+        //                            on new { member.CompanyId, member.OnboardingTeamId }
+        //                            equals new { team.CompanyId, team.OnboardingTeamId }
+        //                        where member.CompanyId == request.CompanyId &&
+        //                              member.EmployeeId == request.UserId &&
+        //                              member.IsActive && team.IsActive
+        //                        select team.OnboardingTeamId
+        //                    ).Distinct().ToListAsync();
+
+        //                    if (teamIds.Count == 0)
+        //                        return Fail(403, "An active onboarding team assignment is required.");
+
+        //                    // Read every mapping, including references to inactive templates.
+        //                    // Missing/invalid targets must never broaden access to all templates.
+        //                    var scopes = await _context.OnboardingTeamTemplates.AsNoTracking()
+        //                        .Where(x => x.CompanyId == request.CompanyId &&
+        //                                    teamIds.Contains(x.OnboardingTeamId))
+        //                        .Select(x => new { x.OnboardingTeamId, x.TemplateId })
+        //                        .ToListAsync();
+
+        //                    var restrictedTeams = scopes.Select(x => x.OnboardingTeamId).ToHashSet();
+        //                    allTemplates = teamIds.Any(id => !restrictedTeams.Contains(id));
+        //                    allowedTemplateIds = scopes.Select(x => x.TemplateId).ToHashSet();
+        //                }
+
+        //                var branchIds = FilterIds(request.BranchIds);
+        //                var departmentIds = FilterIds(request.DepartmentIds);
+        //                var allowedIds = allowedTemplateIds.ToArray();
+
+        //                var query =
+        //                    from application in _context.CandidateApplications.AsNoTracking()
+        //                    join candidate in _context.Candidates.AsNoTracking()
+        //                        on new { application.CompanyId, application.CandidateId }
+        //                        equals new { candidate.CompanyId, candidate.CandidateId }
+        //                    join job in _context.JobDescriptions.AsNoTracking()
+        //                        on new { application.CompanyId, application.JobDescriptionId }
+        //                        equals new { job.CompanyId, job.JobDescriptionId }
+        //                    join template in _context.RoleTemplates.AsNoTracking()
+        //                        on new { job.CompanyId, TemplateId = (int?)job.TemplateId }
+        //                        equals new { template.CompanyId, TemplateId = (int?)template.TemplateId }
+        //                    where application.CompanyId == request.CompanyId &&
+        //                          application.IsActive == true &&
+        //                          candidate.IsActive == true &&
+        //                          template.IsActive == true
+        //                    select new
+        //                    {
+        //                        Application = application,
+        //                        Candidate = candidate,
+        //                        job.JobTitle,
+        //                        template.TemplateId,
+        //                        template.TemplateName
+        //                    };
+
+        //                if (!allTemplates)
+        //                    query = query.Where(x => allowedIds.Contains(x.TemplateId));
+
+        //                if (branchIds.Length > 0)
+        //                    query = query.Where(x => x.Application.BranchId.HasValue &&
+        //                        branchIds.Contains(x.Application.BranchId.Value));
+
+        //                if (departmentIds.Length > 0)
+        //                    query = query.Where(x => x.Application.DepartmentId.HasValue &&
+        //                        departmentIds.Contains(x.Application.DepartmentId.Value));
+
+        //                var rows = await query
+        //                    .OrderByDescending(x => x.Application.CandidateApplicationId)
+        //                    .ToListAsync();
+
+        //                var applicationIds = rows.Select(x => x.Application.CandidateApplicationId)
+        //                    .Distinct().ToArray();
+        //                var templateIds = rows.Select(x => x.TemplateId).Distinct().ToArray();
+
+        //                var assignments = await _context.RoleTemplateAssignment.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                templateIds.Contains(x.TemplateId) &&
+        //                                x.IsActive == true &&
+        //                                x.CanApprove == true)
+        //                    .Select(x => new
+        //                    {
+        //                        x.AssignmentId,
+        //                        x.TemplateId,
+        //                        x.EmployeeId,
+        //                        x.HierarchyLevel
+        //                    })
+        //                    .ToListAsync();
+
+        //                // Include direct admin decisions even when AssignmentId is null.
+        //                var decisions = await _context.CandidateSkillAssessmentHistories
+        //                    .AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                applicationIds.Contains(x.CandidateApplicationId) &&
+        //                                (x.Action == "Approve" ||
+        //                                 x.Action == "Reject" ||
+        //                                 x.Action == "Return"))
+        //                    .ToListAsync();
+
+        //                var adminIds = (await _context.EmployeeMasters.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId && x.IsAdmin == true)
+        //                    .Select(x => (int?)x.EmployeeId)
+        //                    .ToListAsync()).ToHashSet();
+
+        //                var decisionsByApplication = decisions.ToLookup(x => (
+        //                    x.CandidateApplicationId, x.JobDescriptionId));
+        //                var assignmentsByTemplate = assignments.ToLookup(x => x.TemplateId);
+
+        //                var approvalByApplication = rows.ToDictionary(
+        //                    row => row.Application.CandidateApplicationId,
+        //                    row =>
+        //                    {
+        //                        var required = assignmentsByTemplate[row.TemplateId].ToList();
+        //                        var history = decisionsByApplication[(
+        //                            row.Application.CandidateApplicationId,
+        //                            row.Application.JobDescriptionId)].ToList();
+
+        //                        var approvedIds = required.Where(assignment =>
+        //                            history.Where(x =>
+        //                                x.AssignmentId == assignment.AssignmentId &&
+        //                                x.CreatedBy == assignment.EmployeeId)
+        //                            .OrderByDescending(x => x.CreatedOn)
+        //                            .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+        //                            .FirstOrDefault()?.Action == "Approve")
+        //                            .Select(x => x.AssignmentId).ToHashSet();
+
+        //                        bool allApproved = required.Count > 0 &&
+        //                            required.All(x => approvedIds.Contains(x.AssignmentId));
+        //                        bool lastApproved = false;
+        //                        if (required.Count > 0)
+        //                        {
+        //                            int lastLevel = required.Max(x => x.HierarchyLevel);
+        //                            lastApproved = required.Where(x => x.HierarchyLevel == lastLevel)
+        //                                .All(x => approvedIds.Contains(x.AssignmentId));
+        //                        }
+
+        //                        bool adminApproved = history
+        //                            .Where(x => adminIds.Contains(x.CreatedBy))
+        //                            .OrderByDescending(x => x.CreatedOn)
+        //                            .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+        //                            .FirstOrDefault()?.Action == "Approve";
+
+        //                        return new
+        //                        {
+        //                            AllHierarchyApproved = allApproved,
+        //                            LastHierarchyApproved = lastApproved,
+        //                            AdminApproved = adminApproved,
+        //                            IsEligible = lastApproved || adminApproved
+        //                        };
+        //                    });
+
+        //                var eligibleRows = rows.Where(row =>
+        //                    approvalByApplication[row.Application.CandidateApplicationId].IsEligible)
+        //                    .ToList();
+
+        //                var eligibleApplicationIds = eligibleRows
+        //                    .Select(x => x.Application.CandidateApplicationId).ToArray();
+
+        //                // Decision and letter sections are independent in this shared table.
+        //                var appointments = await _context.CandidateAppointmentLetters.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                eligibleApplicationIds.Contains(x.CandidateApplicationId))
+        //                    .ToListAsync();
+
+        //                var appointmentByApplication = appointments.ToDictionary(x => (
+        //                    x.CandidateApplicationId, x.CandidateId, x.JobDescriptionId));
+
+        //                // Includes completed/closed onboarding records for dashboard outcomes.
+        //                var onboardings = await _context.CandidateOnboardings.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                eligibleApplicationIds.Contains(x.CandidateApplicationId))
+        //                    .ToListAsync();
+
+        //                var onboardingByApplication = onboardings.ToDictionary(
+        //                    x => x.CandidateApplicationId);
+
+        //                var onboardingIds = onboardings.Select(x => x.CandidateOnboardingId).ToArray();
+
+        //                var documents = await _context.CandidateOnboardingDocuments.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                onboardingIds.Contains(x.CandidateOnboardingId) &&
+        //                                x.IsActive)
+        //                    .ToListAsync();
+
+        //                var policies = await _context.CandidateOnboardingPolicies.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                onboardingIds.Contains(x.CandidateOnboardingId) &&
+        //                                x.IsActive)
+        //                    .ToListAsync();
+
+        //                var offers = await _context.CandidateOnboardingOffers.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                onboardingIds.Contains(x.CandidateOnboardingId) &&
+        //                                x.IsCurrent)
+        //                    .ToListAsync();
+
+        //                var docsByOnboarding = documents.ToLookup(x => x.CandidateOnboardingId);
+        //                var policiesByOnboarding = policies.ToLookup(x => x.CandidateOnboardingId);
+        //                // A unique filtered index should enforce one current offer.
+        //                var offersByOnboarding = offers.ToLookup(x => x.CandidateOnboardingId);
+
+        //                var resultBranchIds = eligibleRows
+        //                    .Where(x => x.Application.BranchId.HasValue)
+        //                    .Select(x => x.Application.BranchId!.Value).Distinct().ToArray();
+        //                var resultDepartmentIds = eligibleRows
+        //                    .Where(x => x.Application.DepartmentId.HasValue)
+        //                    .Select(x => x.Application.DepartmentId!.Value).Distinct().ToArray();
+
+        //                var branches = await _context.Branches.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                resultBranchIds.Contains(x.BranchId))
+        //                    .ToDictionaryAsync(x => x.BranchId, x => x.BranchName);
+
+        //                var departments = await _context.Departments.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                resultDepartmentIds.Contains(x.DepartmentId))
+        //                    .ToDictionaryAsync(x => x.DepartmentId, x => x.DepartmentName);
+
+        //                // EP mappings use the application's department and that department's branch.
+        //                var epDepartments = await _context.Departments.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                resultDepartmentIds.Contains(x.DepartmentId))
+        //                    .Select(x => new
+        //                    {
+        //                        x.DepartmentId,
+        //                        x.BranchId,
+        //                        x.EPDepartmentId
+        //                    })
+        //                    .ToDictionaryAsync(x => x.DepartmentId);
+
+        //                var departmentBranchIds = epDepartments.Values
+        //                    .Select(x => x.BranchId)
+        //                    .Distinct()
+        //                    .ToArray();
+
+        //                var epBranches = await _context.Branches.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                departmentBranchIds.Contains(x.BranchId))
+        //                    .Select(x => new { x.BranchId, x.EPBranchId })
+        //                    .ToDictionaryAsync(x => x.BranchId);
+
+        //                var epCompany = await _context.Companys.AsNoTracking()
+        //                    .Where(x => x.CompanyID == request.CompanyId)
+        //                    .Select(x => new { x.EpId })
+        //                    .FirstOrDefaultAsync();
+
+        //                var data = eligibleRows.Select(row =>
+        //                {
+        //                    var application = row.Application;
+        //                    var candidate = row.Candidate;
+        //                    onboardingByApplication.TryGetValue(
+        //                        application.CandidateApplicationId, out var onboarding);
+
+        //                    appointmentByApplication.TryGetValue((
+        //                        application.CandidateApplicationId,
+        //                        candidate.CandidateId,
+        //                        application.JobDescriptionId), out var appointment);
+
+        //                    var approval = approvalByApplication[application.CandidateApplicationId];
+
+        //                    // A deleted decision (HasDecision=false) must remain Pending.
+        //                    // Use legacy outcomes only when no new-table record exists.
+        //                    string? finalOutcome = appointment != null
+        //                        ? (appointment.HasDecision ? appointment.FinalDecision : "Pending")
+        //                        : onboarding?.FinalOutcome;
+        //                    string? outcomeRemarks = appointment != null
+        //                        ? (appointment.HasDecision ? appointment.Remarks : null)
+        //                        : onboarding?.OutcomeRemarks;
+        //                    DateTime? actualJoiningDate = appointment != null
+        //                        ? (appointment.HasDecision ? appointment.ActualJoiningDate : null)
+        //                        : onboarding?.ActualJoiningDate;
+
+        //                    int onboardingId = onboarding?.CandidateOnboardingId ?? 0;
+        //                    var docs = docsByOnboarding[onboardingId].ToList();
+        //                    var candidatePolicies = policiesByOnboarding[onboardingId].ToList();
+        //                    var currentOffer = offersByOnboarding[onboardingId]
+        //                        .OrderByDescending(x => x.VersionNumber)
+        //                        .ThenByDescending(x => x.CandidateOnboardingOfferId)
+        //                        .FirstOrDefault();
+
+        //                    int submittedCount = docs.Count(x =>
+        //                        x.Status == "Submitted" || x.Status == "Verified");
+        //                    int verifiedCount = docs.Count(x => x.Status == "Verified");
+        //                    int mandatoryCount = docs.Count(x => x.IsMandatory);
+
+        //                    // No document requests must not imply verification is complete.
+        //                    // If only optional requests exist, require all of them verified
+        //                    // for this dashboard's "Verified Candidates" classification.
+        //                    bool documentsVerified = docs.Count > 0 &&
+        //                        (mandatoryCount > 0
+        //                            ? docs.Where(x => x.IsMandatory).All(x => x.Status == "Verified")
+        //                            : docs.All(x => x.Status == "Verified"));
+
+        //                    string policyStatus = candidatePolicies.Count == 0
+        //                        ? "NotSent"
+        //                        : candidatePolicies.Any(x => x.IsAcknowledged == false)
+        //                            ? "Declined"
+        //                            : candidatePolicies.All(x => x.IsAcknowledged == true)
+        //                                ? "Acknowledged"
+        //                                : candidatePolicies.Any(x => x.SharedOn.HasValue)
+        //                                    ? "AwaitingAcknowledgment"
+        //                                    : "NotSent";
+
+        //                    bool joined = finalOutcome == "Joined";
+        //                    bool closed = joined ||
+        //                        finalOutcome == "Rejected" ||
+        //                        finalOutcome == "OfferDeclined";
+
+        //                    bool activeOnboarding = onboarding == null || onboarding.IsActive;
+
+        //                    int? epDepartmentId = null;
+        //                    int? epBranchId = null;
+        //                    int? epOrgId = epCompany?.EpId;
+
+        //                    if (application.DepartmentId.HasValue &&
+        //                        epDepartments.TryGetValue(
+        //                            application.DepartmentId.Value, out var epDepartment))
+        //                    {
+        //                        epDepartmentId = epDepartment.EPDepartmentId;
+
+        //                        if (epBranches.TryGetValue(epDepartment.BranchId, out var epBranch))
+        //                            epBranchId = epBranch.EPBranchId;
+        //                    }
+
+        //                    string? branchName = null;
+        //                    string? departmentName = null;
+        //                    if (application.BranchId.HasValue)
+        //                        branches.TryGetValue(application.BranchId.Value, out branchName);
+        //                    if (application.DepartmentId.HasValue)
+        //                        departments.TryGetValue(application.DepartmentId.Value, out departmentName);
+
+        //                    return new
+        //                    {
+        //                        application.CompanyId,
+        //                        candidate.CandidateId,
+        //                        application.CandidateApplicationId,
+        //                        application.JobDescriptionId,
+        //                        row.JobTitle,
+        //                        row.TemplateId,
+        //                        row.TemplateName,
+
+        //                        CandidateName = string.Join(" ", new[]
+        //                        {
+        //                candidate.FirstName, candidate.MiddleName, candidate.LastName
+        //            }.Where(x => !string.IsNullOrWhiteSpace(x))),
+        //                        candidate.Email,
+        //                        candidate.MobileNumber,
+
+        //                        IsEPCreated = candidate.IsEpId != null && candidate.IsEpId != 0,
+        //                        CandidateDetails = candidate,
+
+        //                        application.BranchId,
+        //                        BranchName = branchName,
+        //                        application.DepartmentId,
+        //                        DepartmentName = departmentName,
+
+        //                        EPBranchId = epBranchId,
+        //                        EPDepartmentId = epDepartmentId,
+        //                        EPOrgId = epOrgId,
+
+        //                        CandidateOnboardingId = (int?)onboarding?.CandidateOnboardingId,
+        //                        OnboardingStatus = onboarding?.Status ?? "ReadyForOnboarding",
+        //                        OnboardingIsActive = activeOnboarding,
+        //                        AllHierarchyApproved = approval.AllHierarchyApproved,
+        //                        LastHierarchyApproved = approval.LastHierarchyApproved,
+        //                        AdminApproved = approval.AdminApproved,
+        //                        RequiredApprovalCount = assignmentsByTemplate[row.TemplateId].Count(),
+
+        //                        // Eligibility/action flag, separate from completed joining.
+        //                        IsOnBoarding = activeOnboarding && !closed,
+        //                        IsJoined = joined,
+        //                        IsPending = activeOnboarding && !closed,
+        //                        IsVerified = documentsVerified,
+
+        //                        DocumentStatus = submittedCount > 0
+        //                            ? "Submitted" : "RequestDocuments",
+        //                        DocumentStatusText = submittedCount > 0
+        //                            ? "Submitted" : "Request Documents",
+        //                        RequestedDocumentCount = docs.Count,
+        //                        SubmittedDocumentCount = submittedCount,
+        //                        VerifiedDocumentCount = verifiedCount,
+        //                        MandatoryDocumentCount = mandatoryCount,
+        //                        ResubmissionRequiredCount = docs.Count(x =>
+        //                            x.Status == "ResubmissionRequired"),
+
+        //                        CompanyPolicyStatus = policyStatus,
+        //                        PolicyCount = candidatePolicies.Count,
+        //                        AcknowledgedPolicyCount = candidatePolicies.Count(x =>
+        //                            x.IsAcknowledged == true),
+
+        //                        CandidateAppointmentLetterId =
+        //                            (int?)appointment?.CandidateAppointmentLetterId,
+        //                        HasAppointmentLetter = appointment?.HasAppointmentLetter ?? false,
+        //                        HasDecision = appointment?.HasDecision ?? false,
+        //                        OfferLetterFilePath = appointment?.HasAppointmentLetter == true
+        //                            ? appointment.OfferLetterFilePath : null,
+        //                        OfferStatus = appointment != null
+        //                            ? (appointment.HasAppointmentLetter
+        //                                ? (appointment.IsIssued ? "Issued" : "Draft")
+        //                                : "NotIssued")
+        //                            : currentOffer?.Status ?? "NotIssued",
+        //                        OfferResponse = currentOffer?.CandidateResponse,
+        //                        CandidateOnboardingOfferId =
+        //                            (int?)currentOffer?.CandidateOnboardingOfferId,
+
+        //                        OnboardedStatus = joined ? "Joined"
+        //                            : finalOutcome ?? "NotYet",
+        //                        FinalDecisionText = finalOutcome == "Joined"
+        //                            ? "Candidate Joined"
+        //                            : finalOutcome == "OfferDeclined"
+        //                                ? "Offer Declined by Candidate"
+        //                                : finalOutcome == "Rejected"
+        //                                    ? "Candidate Rejected by Company"
+        //                                    : "Pending",
+
+        //                        ExpectedJoiningDate = appointment != null
+        //                            ? (appointment.HasAppointmentLetter
+        //                                ? appointment.ExpectedJoiningDate : (DateTime?)null)
+        //                            : onboarding?.ExpectedJoiningDate
+        //                                ?? currentOffer?.ExpectedJoiningDate,
+        //                        ActualJoiningDate = actualJoiningDate,
+        //                        FinalOutcome = finalOutcome,
+        //                        OutcomeRemarks = outcomeRemarks,
+        //                        application.AppliedOn
+        //                    };
+        //                }).ToList();
+
+        //                return Ok(new
+        //                {
+        //                    Status = true,
+        //                    Message = data.Count > 0
+        //                        ? "Onboarding candidates fetched successfully."
+        //                        : "No candidates with last-hierarchy or admin approval found within your scope.",
+        //                    request.CompanyId,
+        //                    request.UserId,
+        //                    IsAdmin = isAdmin,
+        //                    AllTemplates = allTemplates,
+        //                    Summary = new
+        //                    {
+        //                        TotalCandidate = data.Count,
+        //                        VerifiedCandidate = data.Count(x => x.IsVerified),
+        //                        PendingCandidate = data.Count(x => x.IsPending),
+        //                        JoinedCandidate = data.Count(x => x.IsJoined),
+        //                        OfferDeclinedByCandidate = data.Count(x =>
+        //                            x.FinalOutcome == "OfferDeclined"),
+        //                        CandidateRejectedByCompany = data.Count(x =>
+        //                            x.FinalOutcome == "Rejected")
+        //                    },
+        //                    TotalCount = data.Count,
+        //                    Data = data
+        //                });
+        //            }
+        //            catch (Exception ex)
+        //            {
+        //                Serilog.Log.Error(ex,
+        //                    "Failed to fetch onboarding candidates for CompanyId {CompanyId}, UserId {UserId}.",
+        //                    request.CompanyId, request.UserId);
+        //                return Fail(500, "Unable to fetch onboarding candidates.");
+        //            }
+        //        }
+
+
+        //        [HttpPost("GetOnboardingCandidateList")]
+        //        public async Task<IActionResult> GetOnboardingCandidateList(
+        //[FromBody] GetOnboardingCandidateListRequest? request)
+        //        {
+        //            IActionResult Fail(int code, string message) =>
+        //                StatusCode(code, new { Status = false, Message = message });
+
+        //            if (request == null || request.CompanyId <= 0 || request.UserId <= 0)
+        //                return Fail(400, "Valid CompanyId and UserId are required.");
+
+        //            if (request.BranchIds?.Any(x => x < 0) == true ||
+        //                request.DepartmentIds?.Any(x => x < 0) == true)
+        //                return Fail(400, "Filter IDs cannot be negative.");
+
+        //            static int[] FilterIds(List<int>? ids) =>
+        //                ids == null || ids.Count == 0 || ids.Contains(0)
+        //                    ? Array.Empty<int>()
+        //                    : ids.Distinct().ToArray();
+
+        //            try
+        //            {
+        //                var user = await _context.EmployeeMasters.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                x.EmployeeId == request.UserId)
+        //                    .Select(x => new { x.EmployeeId, x.IsAdmin, x.IsActive })
+        //                    .FirstOrDefaultAsync();
+
+        //                if (user == null) return Fail(404, "User not found for this company.");
+        //                if (user.IsActive != true) return Fail(403, "User is inactive.");
+
+        //                bool isAdmin = user.IsAdmin == true;
+        //                bool allTemplates = isAdmin;
+        //                var allowedTemplateIds = new HashSet<int>();
+
+        //                if (!isAdmin)
+        //                {
+        //                    var teamIds = await (
+        //                        from member in _context.OnboardingTeamMembers.AsNoTracking()
+        //                        join team in _context.OnboardingTeams.AsNoTracking()
+        //                            on new { member.CompanyId, member.OnboardingTeamId }
+        //                            equals new { team.CompanyId, team.OnboardingTeamId }
+        //                        where member.CompanyId == request.CompanyId &&
+        //                              member.EmployeeId == request.UserId &&
+        //                              member.IsActive && team.IsActive
+        //                        select team.OnboardingTeamId
+        //                    ).Distinct().ToListAsync();
+
+        //                    if (teamIds.Count == 0)
+        //                        return Fail(403, "An active onboarding team assignment is required.");
+
+        //                    // Read every mapping, including references to inactive templates.
+        //                    // Missing/invalid targets must never broaden access to all templates.
+        //                    var scopes = await _context.OnboardingTeamTemplates.AsNoTracking()
+        //                        .Where(x => x.CompanyId == request.CompanyId &&
+        //                                    teamIds.Contains(x.OnboardingTeamId))
+        //                        .Select(x => new { x.OnboardingTeamId, x.TemplateId })
+        //                        .ToListAsync();
+
+        //                    var restrictedTeams = scopes.Select(x => x.OnboardingTeamId).ToHashSet();
+        //                    allTemplates = teamIds.Any(id => !restrictedTeams.Contains(id));
+        //                    allowedTemplateIds = scopes.Select(x => x.TemplateId).ToHashSet();
+        //                }
+
+        //                var branchIds = FilterIds(request.BranchIds);
+        //                var departmentIds = FilterIds(request.DepartmentIds);
+        //                var allowedIds = allowedTemplateIds.ToArray();
+
+        //                var query =
+        //                    from application in _context.CandidateApplications.AsNoTracking()
+        //                    join candidate in _context.Candidates.AsNoTracking()
+        //                        on new { application.CompanyId, application.CandidateId }
+        //                        equals new { candidate.CompanyId, candidate.CandidateId }
+        //                    join job in _context.JobDescriptions.AsNoTracking()
+        //                        on new { application.CompanyId, application.JobDescriptionId }
+        //                        equals new { job.CompanyId, job.JobDescriptionId }
+        //                    join template in _context.RoleTemplates.AsNoTracking()
+        //                        on new { job.CompanyId, TemplateId = (int?)job.TemplateId }
+        //                        equals new { template.CompanyId, TemplateId = (int?)template.TemplateId }
+        //                    where application.CompanyId == request.CompanyId &&
+        //                          application.IsActive == true &&
+        //                          candidate.IsActive == true &&
+        //                          template.IsActive == true
+        //                    select new
+        //                    {
+        //                        Application = application,
+        //                        Candidate = candidate,
+        //                        job.JobTitle,
+        //                        template.TemplateId,
+        //                        template.TemplateName
+        //                    };
+
+        //                if (!allTemplates)
+        //                    query = query.Where(x => allowedIds.Contains(x.TemplateId));
+
+        //                if (branchIds.Length > 0)
+        //                    query = query.Where(x => x.Application.BranchId.HasValue &&
+        //                        branchIds.Contains(x.Application.BranchId.Value));
+
+        //                if (departmentIds.Length > 0)
+        //                    query = query.Where(x => x.Application.DepartmentId.HasValue &&
+        //                        departmentIds.Contains(x.Application.DepartmentId.Value));
+
+        //                var rows = await query
+        //                    .OrderByDescending(x => x.Application.CandidateApplicationId)
+        //                    .ToListAsync();
+
+        //                var applicationIds = rows.Select(x => x.Application.CandidateApplicationId)
+        //                    .Distinct().ToArray();
+        //                var templateIds = rows.Select(x => x.TemplateId).Distinct().ToArray();
+
+        //                var assignments = await _context.RoleTemplateAssignment.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                templateIds.Contains(x.TemplateId) &&
+        //                                x.IsActive == true &&
+        //                                x.CanApprove == true)
+        //                    .Select(x => new
+        //                    {
+        //                        x.AssignmentId,
+        //                        x.TemplateId,
+        //                        x.EmployeeId,
+        //                        x.HierarchyLevel
+        //                    })
+        //                    .ToListAsync();
+
+        //                // Include direct admin decisions even when AssignmentId is null.
+        //                var decisions = await _context.CandidateSkillAssessmentHistories
+        //                    .AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                applicationIds.Contains(x.CandidateApplicationId) &&
+        //                                (x.Action == "Approve" ||
+        //                                 x.Action == "Reject" ||
+        //                                 x.Action == "Return"))
+        //                    .ToListAsync();
+
+        //                var adminIds = (await _context.EmployeeMasters.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId && x.IsAdmin == true)
+        //                    .Select(x => (int?)x.EmployeeId)
+        //                    .ToListAsync()).ToHashSet();
+
+        //                var decisionsByApplication = decisions.ToLookup(x => (
+        //                    x.CandidateApplicationId, x.JobDescriptionId));
+        //                var assignmentsByTemplate = assignments.ToLookup(x => x.TemplateId);
+
+        //                var approvalByApplication = rows.ToDictionary(
+        //                    row => row.Application.CandidateApplicationId,
+        //                    row =>
+        //                    {
+        //                        var required = assignmentsByTemplate[row.TemplateId].ToList();
+        //                        var history = decisionsByApplication[(
+        //                            row.Application.CandidateApplicationId,
+        //                            row.Application.JobDescriptionId)].ToList();
+
+        //                        var approvedIds = required.Where(assignment =>
+        //                            history.Where(x =>
+        //                                x.AssignmentId == assignment.AssignmentId &&
+        //                                x.CreatedBy == assignment.EmployeeId)
+        //                            .OrderByDescending(x => x.CreatedOn)
+        //                            .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+        //                            .FirstOrDefault()?.Action == "Approve")
+        //                            .Select(x => x.AssignmentId).ToHashSet();
+
+        //                        bool allApproved = required.Count > 0 &&
+        //                            required.All(x => approvedIds.Contains(x.AssignmentId));
+        //                        bool lastApproved = false;
+        //                        if (required.Count > 0)
+        //                        {
+        //                            int lastLevel = required.Max(x => x.HierarchyLevel);
+        //                            lastApproved = required.Where(x => x.HierarchyLevel == lastLevel)
+        //                                .All(x => approvedIds.Contains(x.AssignmentId));
+        //                        }
+
+        //                        bool adminApproved = history
+        //                            .Where(x => adminIds.Contains(x.CreatedBy))
+        //                            .OrderByDescending(x => x.CreatedOn)
+        //                            .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+        //                            .FirstOrDefault()?.Action == "Approve";
+
+        //                        return new
+        //                        {
+        //                            AllHierarchyApproved = allApproved,
+        //                            LastHierarchyApproved = lastApproved,
+        //                            AdminApproved = adminApproved,
+        //                            IsEligible = lastApproved || adminApproved
+        //                        };
+        //                    });
+
+        //                var eligibleRows = rows.Where(row =>
+        //                    approvalByApplication[row.Application.CandidateApplicationId].IsEligible)
+        //                    .ToList();
+
+        //                var eligibleApplicationIds = eligibleRows
+        //                    .Select(x => x.Application.CandidateApplicationId).ToArray();
+
+        //                // Decision and letter sections are independent in this shared table.
+        //                var appointments = await _context.CandidateAppointmentLetters.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                eligibleApplicationIds.Contains(x.CandidateApplicationId))
+        //                    .ToListAsync();
+
+        //                var appointmentByApplication = appointments.ToDictionary(x => (
+        //                    x.CandidateApplicationId, x.CandidateId, x.JobDescriptionId));
+
+        //                // Includes completed/closed onboarding records for dashboard outcomes.
+        //                var onboardings = await _context.CandidateOnboardings.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                eligibleApplicationIds.Contains(x.CandidateApplicationId))
+        //                    .ToListAsync();
+
+        //                var onboardingByApplication = onboardings.ToDictionary(
+        //                    x => x.CandidateApplicationId);
+
+        //                var onboardingIds = onboardings.Select(x => x.CandidateOnboardingId).ToArray();
+
+        //                var documents = await _context.CandidateOnboardingDocuments.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                onboardingIds.Contains(x.CandidateOnboardingId) &&
+        //                                x.IsActive)
+        //                    .ToListAsync();
+
+        //                var policies = await _context.CandidateOnboardingPolicies.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                onboardingIds.Contains(x.CandidateOnboardingId) &&
+        //                                x.IsActive)
+        //                    .ToListAsync();
+
+        //                var offers = await _context.CandidateOnboardingOffers.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                onboardingIds.Contains(x.CandidateOnboardingId) &&
+        //                                x.IsCurrent)
+        //                    .ToListAsync();
+
+        //                var docsByOnboarding = documents.ToLookup(x => x.CandidateOnboardingId);
+        //                var policiesByOnboarding = policies.ToLookup(x => x.CandidateOnboardingId);
+        //                // A unique filtered index should enforce one current offer.
+        //                var offersByOnboarding = offers.ToLookup(x => x.CandidateOnboardingId);
+
+        //                var resultBranchIds = eligibleRows
+        //                    .Where(x => x.Application.BranchId.HasValue)
+        //                    .Select(x => x.Application.BranchId!.Value).Distinct().ToArray();
+        //                var resultDepartmentIds = eligibleRows
+        //                    .Where(x => x.Application.DepartmentId.HasValue)
+        //                    .Select(x => x.Application.DepartmentId!.Value).Distinct().ToArray();
+
+        //                var branches = await _context.Branches.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                resultBranchIds.Contains(x.BranchId))
+        //                    .ToDictionaryAsync(x => x.BranchId, x => x.BranchName);
+
+        //                var departments = await _context.Departments.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                resultDepartmentIds.Contains(x.DepartmentId))
+        //                    .ToDictionaryAsync(x => x.DepartmentId, x => x.DepartmentName);
+
+        //                // EP mappings use the application's department and that department's branch.
+        //                var epDepartments = await _context.Departments.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                resultDepartmentIds.Contains(x.DepartmentId))
+        //                    .Select(x => new
+        //                    {
+        //                        x.DepartmentId,
+        //                        x.BranchId,
+        //                        x.EPDepartmentId
+        //                    })
+        //                    .ToDictionaryAsync(x => x.DepartmentId);
+
+        //                var departmentBranchIds = epDepartments.Values
+        //                    .Select(x => x.BranchId)
+        //                    .Distinct()
+        //                    .ToArray();
+
+        //                var epBranches = await _context.Branches.AsNoTracking()
+        //                    .Where(x => x.CompanyId == request.CompanyId &&
+        //                                departmentBranchIds.Contains(x.BranchId))
+        //                    .Select(x => new { x.BranchId, x.EPBranchId })
+        //                    .ToDictionaryAsync(x => x.BranchId);
+
+        //                var epCompany = await _context.Companys.AsNoTracking()
+        //                    .Where(x => x.CompanyID == request.CompanyId)
+        //                    .Select(x => new { x.EpId })
+        //                    .FirstOrDefaultAsync();
+
+        //                var data = eligibleRows.Select(row =>
+        //                {
+        //                    var application = row.Application;
+        //                    var candidate = row.Candidate;
+        //                    onboardingByApplication.TryGetValue(
+        //                        application.CandidateApplicationId, out var onboarding);
+
+        //                    appointmentByApplication.TryGetValue((
+        //                        application.CandidateApplicationId,
+        //                        candidate.CandidateId,
+        //                        application.JobDescriptionId), out var appointment);
+
+        //                    var approval = approvalByApplication[application.CandidateApplicationId];
+
+        //                    // A deleted decision (HasDecision=false) must remain Pending.
+        //                    // Use legacy outcomes only when no new-table record exists.
+        //                    string? finalOutcome = appointment != null
+        //                        ? (appointment.HasDecision ? appointment.FinalDecision : "Pending")
+        //                        : onboarding?.FinalOutcome;
+        //                    string? outcomeRemarks = appointment != null
+        //                        ? (appointment.HasDecision ? appointment.Remarks : null)
+        //                        : onboarding?.OutcomeRemarks;
+        //                    DateTime? actualJoiningDate = appointment != null
+        //                        ? (appointment.HasDecision ? appointment.ActualJoiningDate : null)
+        //                        : onboarding?.ActualJoiningDate;
+
+        //                    int onboardingId = onboarding?.CandidateOnboardingId ?? 0;
+        //                    var docs = docsByOnboarding[onboardingId].ToList();
+        //                    var candidatePolicies = policiesByOnboarding[onboardingId].ToList();
+        //                    var currentOffer = offersByOnboarding[onboardingId]
+        //                        .OrderByDescending(x => x.VersionNumber)
+        //                        .ThenByDescending(x => x.CandidateOnboardingOfferId)
+        //                        .FirstOrDefault();
+
+        //                    int submittedCount = docs.Count(x =>
+        //                        x.Status == "Submitted" || x.Status == "Verified");
+        //                    int verifiedCount = docs.Count(x => x.Status == "Verified");
+        //                    int mandatoryCount = docs.Count(x => x.IsMandatory);
+
+        //                    // No document requests must not imply verification is complete.
+        //                    // If only optional requests exist, require all of them verified
+        //                    // for this dashboard's "Verified Candidates" classification.
+        //                    bool documentsVerified = docs.Count > 0 &&
+        //                        (mandatoryCount > 0
+        //                            ? docs.Where(x => x.IsMandatory).All(x => x.Status == "Verified")
+        //                            : docs.All(x => x.Status == "Verified"));
+
+        //                    string policyStatus = candidatePolicies.Count == 0
+        //                        ? "NotSent"
+        //                        : candidatePolicies.Any(x => x.IsAcknowledged == false)
+        //                            ? "Declined"
+        //                            : candidatePolicies.All(x => x.IsAcknowledged == true)
+        //                                ? "Acknowledged"
+        //                                : candidatePolicies.Any(x => x.SharedOn.HasValue)
+        //                                    ? "AwaitingAcknowledgment"
+        //                                    : "NotSent";
+
+        //                    bool joined = finalOutcome == "Joined";
+        //                    bool closed = joined ||
+        //                        finalOutcome == "Rejected" ||
+        //                        finalOutcome == "OfferDeclined";
+
+        //                    bool activeOnboarding = onboarding == null || onboarding.IsActive;
+
+        //                    int? epDepartmentId = null;
+        //                    int? epBranchId = null;
+        //                    int? epOrgId = epCompany?.EpId;
+
+        //                    if (application.DepartmentId.HasValue &&
+        //                        epDepartments.TryGetValue(
+        //                            application.DepartmentId.Value, out var epDepartment))
+        //                    {
+        //                        epDepartmentId = epDepartment.EPDepartmentId;
+
+        //                        if (epBranches.TryGetValue(epDepartment.BranchId, out var epBranch))
+        //                            epBranchId = epBranch.EPBranchId;
+        //                    }
+
+        //                    string? branchName = null;
+        //                    string? departmentName = null;
+        //                    if (application.BranchId.HasValue)
+        //                        branches.TryGetValue(application.BranchId.Value, out branchName);
+        //                    if (application.DepartmentId.HasValue)
+        //                        departments.TryGetValue(application.DepartmentId.Value, out departmentName);
+
+        //                    return new
+        //                    {
+        //                        application.CompanyId,
+        //                        candidate.CandidateId,
+        //                        application.CandidateApplicationId,
+        //                        application.JobDescriptionId,
+        //                        row.JobTitle,
+        //                        row.TemplateId,
+        //                        row.TemplateName,
+
+        //                        CandidateName = string.Join(" ", new[]
+        //                        {
+        //                candidate.FirstName, candidate.MiddleName, candidate.LastName
+        //            }.Where(x => !string.IsNullOrWhiteSpace(x))),
+        //                        candidate.Email,
+        //                        candidate.MobileNumber,
+
+        //                        IsEPCreated = candidate.IsEpId != null && candidate.IsEpId != 0,
+        //                        CandidateDetails = candidate,
+
+        //                        application.BranchId,
+        //                        BranchName = branchName,
+        //                        application.DepartmentId,
+        //                        DepartmentName = departmentName,
+
+        //                        EPBranchId = epBranchId,
+        //                        EPDepartmentId = epDepartmentId,
+        //                        EPOrgId = epOrgId,
+
+        //                        CandidateOnboardingId = (int?)onboarding?.CandidateOnboardingId,
+        //                        OnboardingStatus = onboarding?.Status ?? "ReadyForOnboarding",
+        //                        OnboardingIsActive = activeOnboarding,
+        //                        AllHierarchyApproved = approval.AllHierarchyApproved,
+        //                        LastHierarchyApproved = approval.LastHierarchyApproved,
+        //                        AdminApproved = approval.AdminApproved,
+        //                        RequiredApprovalCount = assignmentsByTemplate[row.TemplateId].Count(),
+
+        //                        // Eligibility/action flag, separate from completed joining.
+        //                        IsOnBoarding = activeOnboarding && !closed,
+        //                        IsJoined = joined,
+        //                        IsPending = activeOnboarding && !closed,
+        //                        IsVerified = documentsVerified,
+
+        //                        DocumentStatus = submittedCount > 0
+        //                            ? "Submitted" : "RequestDocuments",
+        //                        DocumentStatusText = submittedCount > 0
+        //                            ? "Submitted" : "Request Documents",
+        //                        RequestedDocumentCount = docs.Count,
+        //                        SubmittedDocumentCount = submittedCount,
+        //                        VerifiedDocumentCount = verifiedCount,
+        //                        MandatoryDocumentCount = mandatoryCount,
+        //                        ResubmissionRequiredCount = docs.Count(x =>
+        //                            x.Status == "ResubmissionRequired"),
+
+        //                        CompanyPolicyStatus = policyStatus,
+        //                        PolicyCount = candidatePolicies.Count,
+        //                        AcknowledgedPolicyCount = candidatePolicies.Count(x =>
+        //                            x.IsAcknowledged == true),
+
+        //                        CandidateAppointmentLetterId =
+        //                            (int?)appointment?.CandidateAppointmentLetterId,
+        //                        HasAppointmentLetter = appointment?.HasAppointmentLetter ?? false,
+        //                        HasDecision = appointment?.HasDecision ?? false,
+        //                        OfferLetterFilePath = appointment?.HasAppointmentLetter == true
+        //                            ? appointment.OfferLetterFilePath : null,
+        //                        OfferStatus = appointment != null
+        //                            ? (appointment.HasAppointmentLetter
+        //                                ? (appointment.IsIssued ? "Issued" : "Draft")
+        //                                : "NotIssued")
+        //                            : currentOffer?.Status ?? "NotIssued",
+        //                        OfferResponse = currentOffer?.CandidateResponse,
+        //                        CandidateOnboardingOfferId =
+        //                            (int?)currentOffer?.CandidateOnboardingOfferId,
+
+        //                        OnboardedStatus = joined ? "Joined"
+        //                            : finalOutcome ?? "NotYet",
+        //                        FinalDecisionText = finalOutcome == "Joined"
+        //                            ? "Candidate Joined"
+        //                            : finalOutcome == "OfferDeclined"
+        //                                ? "Offer Declined by Candidate"
+        //                                : finalOutcome == "Rejected"
+        //                                    ? "Candidate Rejected by Company"
+        //                                    : "Pending",
+
+        //                        ExpectedJoiningDate = appointment != null
+        //                            ? (appointment.HasAppointmentLetter
+        //                                ? appointment.ExpectedJoiningDate : (DateTime?)null)
+        //                            : onboarding?.ExpectedJoiningDate
+        //                                ?? currentOffer?.ExpectedJoiningDate,
+        //                        ActualJoiningDate = actualJoiningDate,
+        //                        FinalOutcome = finalOutcome,
+        //                        OutcomeRemarks = outcomeRemarks,
+        //                        application.AppliedOn
+        //                    };
+        //                }).ToList();
+
+        //                return Ok(new
+        //                {
+        //                    Status = true,
+        //                    Message = data.Count > 0
+        //                        ? "Onboarding candidates fetched successfully."
+        //                        : "No candidates with last-hierarchy or admin approval found within your scope.",
+        //                    request.CompanyId,
+        //                    request.UserId,
+        //                    IsAdmin = isAdmin,
+        //                    AllTemplates = allTemplates,
+        //                    Summary = new
+        //                    {
+        //                        TotalCandidate = data.Count,
+        //                        VerifiedCandidate = data.Count(x => x.IsVerified),
+        //                        PendingCandidate = data.Count(x => x.IsPending),
+        //                        JoinedCandidate = data.Count(x => x.IsJoined),
+        //                        OfferDeclinedByCandidate = data.Count(x =>
+        //                            x.FinalOutcome == "OfferDeclined"),
+        //                        CandidateRejectedByCompany = data.Count(x =>
+        //                            x.FinalOutcome == "Rejected")
+        //                    },
+        //                    TotalCount = data.Count,
+        //                    Data = data
+        //                });
+        //            }
+        //            catch (Exception ex)
+        //            {
+        //                Serilog.Log.Error(ex,
+        //                    "Failed to fetch onboarding candidates for CompanyId {CompanyId}, UserId {UserId}.",
+        //                    request.CompanyId, request.UserId);
+        //                return Fail(500, "Unable to fetch onboarding candidates.");
+        //            }
+        //        }
+
+        [HttpPost("GetOnboardingCandidateList")]
         public async Task<IActionResult> GetOnboardingCandidateList(
-    [FromBody] GetOnboardingCandidateListRequest? request)
+[FromBody] GetOnboardingCandidateListRequest? request)
         {
             IActionResult Fail(int code, string message) =>
                 StatusCode(code, new { Status = false, Message = message });
@@ -879,8 +3639,20 @@ public class GetOnboardingCandidateListRequest
                     ? Array.Empty<int>()
                     : ids.Distinct().ToArray();
 
-            static bool IsDecision(string? action) =>
-                action == "Approve" || action == "Reject" || action == "Return";
+            if (request.JobDescriptionIds?.Any(x => x < 0) == true)
+                return Fail(400, "JobDescriptionIds cannot contain negative IDs.");
+
+            if (request.JoiningFrom.HasValue && request.JoiningTo.HasValue &&
+                request.JoiningFrom.Value.Date > request.JoiningTo.Value.Date)
+                return Fail(400, "JoiningFrom cannot be after JoiningTo.");
+
+            static string NormalizeFilter(string? value) =>
+                new string((value ?? "").Where(char.IsLetterOrDigit).ToArray())
+                    .ToLowerInvariant();
+
+            static bool MatchesSearch(string? value, string search) =>
+                value != null && value.IndexOf(search,
+                    StringComparison.OrdinalIgnoreCase) >= 0;
 
             try
             {
@@ -965,6 +3737,11 @@ public class GetOnboardingCandidateListRequest
                     query = query.Where(x => x.Application.DepartmentId.HasValue &&
                         departmentIds.Contains(x.Application.DepartmentId.Value));
 
+                var selectedJobIds = FilterIds(request.JobDescriptionIds);
+                if (selectedJobIds.Length > 0)
+                    query = query.Where(x =>
+                        selectedJobIds.Contains(x.Application.JobDescriptionId));
+
                 var rows = await query
                     .OrderByDescending(x => x.Application.CandidateApplicationId)
                     .ToListAsync();
@@ -987,50 +3764,83 @@ public class GetOnboardingCandidateListRequest
                     })
                     .ToListAsync();
 
-                var assignmentIds = assignments.Select(x => x.AssignmentId).ToArray();
-
+                // Include direct admin decisions even when AssignmentId is null.
                 var decisions = await _context.CandidateSkillAssessmentHistories
                     .AsNoTracking()
                     .Where(x => x.CompanyId == request.CompanyId &&
                                 applicationIds.Contains(x.CandidateApplicationId) &&
-                                x.AssignmentId.HasValue &&
-                                assignmentIds.Contains(x.AssignmentId.Value) &&
                                 (x.Action == "Approve" ||
                                  x.Action == "Reject" ||
                                  x.Action == "Return"))
                     .ToListAsync();
 
-                // Group per application, job and assignment. Author must be the assigned
-                // employee; an admin action under someone else's assignment does not
-                // stand in for that employee's approval.
-                var decisionsByAssignment = decisions.ToLookup(x => (
-                    x.CandidateApplicationId, x.JobDescriptionId, x.AssignmentId!.Value));
+                var adminIds = (await _context.EmployeeMasters.AsNoTracking()
+                    .Where(x => x.CompanyId == request.CompanyId && x.IsAdmin == true)
+                    .Select(x => (int?)x.EmployeeId)
+                    .ToListAsync()).ToHashSet();
 
+                var decisionsByApplication = decisions.ToLookup(x => (
+                    x.CandidateApplicationId, x.JobDescriptionId));
                 var assignmentsByTemplate = assignments.ToLookup(x => x.TemplateId);
 
-                var eligibleRows = rows.Where(row =>
-                {
-                    var required = assignmentsByTemplate[row.TemplateId].ToList();
-                    if (required.Count == 0) return false;
-
-                    return required.All(assignment =>
+                var approvalByApplication = rows.ToDictionary(
+                    row => row.Application.CandidateApplicationId,
+                    row =>
                     {
-                        var latest = decisionsByAssignment[(
+                        var required = assignmentsByTemplate[row.TemplateId].ToList();
+                        var history = decisionsByApplication[(
                             row.Application.CandidateApplicationId,
-                            row.Application.JobDescriptionId,
-                            assignment.AssignmentId)]
-                            .Where(x => x.CreatedBy == assignment.EmployeeId &&
-                                        IsDecision(x.Action))
+                            row.Application.JobDescriptionId)].ToList();
+
+                        var approvedIds = required.Where(assignment =>
+                            history.Where(x =>
+                                x.AssignmentId == assignment.AssignmentId &&
+                                x.CreatedBy == assignment.EmployeeId)
                             .OrderByDescending(x => x.CreatedOn)
                             .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
-                            .FirstOrDefault();
+                            .FirstOrDefault()?.Action == "Approve")
+                            .Select(x => x.AssignmentId).ToHashSet();
 
-                        return latest?.Action == "Approve";
+                        bool allApproved = required.Count > 0 &&
+                            required.All(x => approvedIds.Contains(x.AssignmentId));
+                        bool lastApproved = false;
+                        if (required.Count > 0)
+                        {
+                            int lastLevel = required.Max(x => x.HierarchyLevel);
+                            lastApproved = required.Where(x => x.HierarchyLevel == lastLevel)
+                                .All(x => approvedIds.Contains(x.AssignmentId));
+                        }
+
+                        bool adminApproved = history
+                            .Where(x => adminIds.Contains(x.CreatedBy))
+                            .OrderByDescending(x => x.CreatedOn)
+                            .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
+                            .FirstOrDefault()?.Action == "Approve";
+
+                        return new
+                        {
+                            AllHierarchyApproved = allApproved,
+                            LastHierarchyApproved = lastApproved,
+                            AdminApproved = adminApproved,
+                            IsEligible = lastApproved || adminApproved
+                        };
                     });
-                }).ToList();
+
+                var eligibleRows = rows.Where(row =>
+                    approvalByApplication[row.Application.CandidateApplicationId].IsEligible)
+                    .ToList();
 
                 var eligibleApplicationIds = eligibleRows
                     .Select(x => x.Application.CandidateApplicationId).ToArray();
+
+                // Decision and letter sections are independent in this shared table.
+                var appointments = await _context.CandidateAppointmentLetters.AsNoTracking()
+                    .Where(x => x.CompanyId == request.CompanyId &&
+                                eligibleApplicationIds.Contains(x.CandidateApplicationId))
+                    .ToListAsync();
+
+                var appointmentByApplication = appointments.ToDictionary(x => (
+                    x.CandidateApplicationId, x.CandidateId, x.JobDescriptionId));
 
                 // Includes completed/closed onboarding records for dashboard outcomes.
                 var onboardings = await _context.CandidateOnboardings.AsNoTracking()
@@ -1083,12 +3893,59 @@ public class GetOnboardingCandidateListRequest
                                 resultDepartmentIds.Contains(x.DepartmentId))
                     .ToDictionaryAsync(x => x.DepartmentId, x => x.DepartmentName);
 
+                // EP mappings use the application's department and that department's branch.
+                var epDepartments = await _context.Departments.AsNoTracking()
+                    .Where(x => x.CompanyId == request.CompanyId &&
+                                resultDepartmentIds.Contains(x.DepartmentId))
+                    .Select(x => new
+                    {
+                        x.DepartmentId,
+                        x.BranchId,
+                        x.EPDepartmentId
+                    })
+                    .ToDictionaryAsync(x => x.DepartmentId);
+
+                var departmentBranchIds = epDepartments.Values
+                    .Select(x => x.BranchId)
+                    .Distinct()
+                    .ToArray();
+
+                var epBranches = await _context.Branches.AsNoTracking()
+                    .Where(x => x.CompanyId == request.CompanyId &&
+                                departmentBranchIds.Contains(x.BranchId))
+                    .Select(x => new { x.BranchId, x.EPBranchId })
+                    .ToDictionaryAsync(x => x.BranchId);
+
+                var epCompany = await _context.Companys.AsNoTracking()
+                    .Where(x => x.CompanyID == request.CompanyId)
+                    .Select(x => new { x.EpId })
+                    .FirstOrDefaultAsync();
+
                 var data = eligibleRows.Select(row =>
                 {
                     var application = row.Application;
                     var candidate = row.Candidate;
                     onboardingByApplication.TryGetValue(
                         application.CandidateApplicationId, out var onboarding);
+
+                    appointmentByApplication.TryGetValue((
+                        application.CandidateApplicationId,
+                        candidate.CandidateId,
+                        application.JobDescriptionId), out var appointment);
+
+                    var approval = approvalByApplication[application.CandidateApplicationId];
+
+                    // A deleted decision (HasDecision=false) must remain Pending.
+                    // Use legacy outcomes only when no new-table record exists.
+                    string? finalOutcome = appointment != null
+                        ? (appointment.HasDecision ? appointment.FinalDecision : "Pending")
+                        : onboarding?.FinalOutcome;
+                    string? outcomeRemarks = appointment != null
+                        ? (appointment.HasDecision ? appointment.Remarks : null)
+                        : onboarding?.OutcomeRemarks;
+                    DateTime? actualJoiningDate = appointment != null
+                        ? (appointment.HasDecision ? appointment.ActualJoiningDate : null)
+                        : onboarding?.ActualJoiningDate;
 
                     int onboardingId = onboarding?.CandidateOnboardingId ?? 0;
                     var docs = docsByOnboarding[onboardingId].ToList();
@@ -1121,12 +3978,26 @@ public class GetOnboardingCandidateListRequest
                                     ? "AwaitingAcknowledgment"
                                     : "NotSent";
 
-                    bool joined = onboarding?.FinalOutcome == "Joined";
+                    bool joined = finalOutcome == "Joined";
                     bool closed = joined ||
-                        onboarding?.FinalOutcome == "Rejected" ||
-                        onboarding?.FinalOutcome == "OfferDeclined";
+                        finalOutcome == "Rejected" ||
+                        finalOutcome == "OfferDeclined";
 
                     bool activeOnboarding = onboarding == null || onboarding.IsActive;
+
+                    int? epDepartmentId = null;
+                    int? epBranchId = null;
+                    int? epOrgId = epCompany?.EpId;
+
+                    if (application.DepartmentId.HasValue &&
+                        epDepartments.TryGetValue(
+                            application.DepartmentId.Value, out var epDepartment))
+                    {
+                        epDepartmentId = epDepartment.EPDepartmentId;
+
+                        if (epBranches.TryGetValue(epDepartment.BranchId, out var epBranch))
+                            epBranchId = epBranch.EPBranchId;
+                    }
 
                     string? branchName = null;
                     string? departmentName = null;
@@ -1147,20 +4018,29 @@ public class GetOnboardingCandidateListRequest
 
                         CandidateName = string.Join(" ", new[]
                         {
-                    candidate.FirstName, candidate.MiddleName, candidate.LastName
-                }.Where(x => !string.IsNullOrWhiteSpace(x))),
+                candidate.FirstName, candidate.MiddleName, candidate.LastName
+            }.Where(x => !string.IsNullOrWhiteSpace(x))),
                         candidate.Email,
                         candidate.MobileNumber,
+
+                        IsEPCreated = candidate.IsEpId != null && candidate.IsEpId != 0,
+                        CandidateDetails = candidate,
 
                         application.BranchId,
                         BranchName = branchName,
                         application.DepartmentId,
                         DepartmentName = departmentName,
 
+                        EPBranchId = epBranchId,
+                        EPDepartmentId = epDepartmentId,
+                        EPOrgId = epOrgId,
+
                         CandidateOnboardingId = (int?)onboarding?.CandidateOnboardingId,
                         OnboardingStatus = onboarding?.Status ?? "ReadyForOnboarding",
                         OnboardingIsActive = activeOnboarding,
-                        AllHierarchyApproved = true,
+                        AllHierarchyApproved = approval.AllHierarchyApproved,
+                        LastHierarchyApproved = approval.LastHierarchyApproved,
+                        AdminApproved = approval.AdminApproved,
                         RequiredApprovalCount = assignmentsByTemplate[row.TemplateId].Count(),
 
                         // Eligibility/action flag, separate from completed joining.
@@ -1185,29 +4065,109 @@ public class GetOnboardingCandidateListRequest
                         AcknowledgedPolicyCount = candidatePolicies.Count(x =>
                             x.IsAcknowledged == true),
 
-                        OfferStatus = currentOffer?.Status ?? "NotIssued",
+                        CandidateAppointmentLetterId =
+                            (int?)appointment?.CandidateAppointmentLetterId,
+                        HasAppointmentLetter = appointment?.HasAppointmentLetter ?? false,
+                        HasDecision = appointment?.HasDecision ?? false,
+                        OfferLetterFilePath = appointment?.HasAppointmentLetter == true
+                            ? appointment.OfferLetterFilePath : null,
+                        OfferStatus = appointment != null
+                            ? (appointment.HasAppointmentLetter
+                                ? (appointment.IsIssued ? "Issued" : "Draft")
+                                : "NotIssued")
+                            : currentOffer?.Status ?? "NotIssued",
                         OfferResponse = currentOffer?.CandidateResponse,
                         CandidateOnboardingOfferId =
                             (int?)currentOffer?.CandidateOnboardingOfferId,
 
                         OnboardedStatus = joined ? "Joined"
-                            : onboarding?.FinalOutcome ?? "NotYet",
+                            : finalOutcome ?? "NotYet",
+                        FinalDecisionText = finalOutcome == "Joined"
+                            ? "Candidate Joined"
+                            : finalOutcome == "OfferDeclined"
+                                ? "Offer Declined by Candidate"
+                                : finalOutcome == "Rejected"
+                                    ? "Candidate Rejected by Company"
+                                    : "Pending",
 
-                        ExpectedJoiningDate = onboarding?.ExpectedJoiningDate
-                            ?? currentOffer?.ExpectedJoiningDate,
-                        ActualJoiningDate = onboarding?.ActualJoiningDate,
-                        FinalOutcome = onboarding?.FinalOutcome,
-                        OutcomeRemarks = onboarding?.OutcomeRemarks,
+                        ExpectedJoiningDate = appointment != null
+                            ? (appointment.HasAppointmentLetter
+                                ? appointment.ExpectedJoiningDate : (DateTime?)null)
+                            : onboarding?.ExpectedJoiningDate
+                                ?? currentOffer?.ExpectedJoiningDate,
+                        ActualJoiningDate = actualJoiningDate,
+                        FinalOutcome = finalOutcome,
+                        OutcomeRemarks = outcomeRemarks,
                         application.AppliedOn
                     };
                 }).ToList();
+
+                // Optional UI filters. With no filters, the original data stays unchanged.
+                string statusFilter = NormalizeFilter(request.Status);
+                if (statusFilter != "" && statusFilter != "all" &&
+                    statusFilter != "allstatuses" && statusFilter != "0")
+                {
+                    data = data.Where(x => statusFilter switch
+                    {
+                        "pending" or "pendingonboarding" => x.IsPending,
+                        "verified" or "verifieddocuments" => x.IsVerified,
+                        "joined" or "candidatejoined" or "joinedcandidates" => x.IsJoined,
+                        "offerdeclined" or "offerdeclinedbycandidate" =>
+                            x.FinalOutcome == "OfferDeclined",
+                        "rejected" or "candidaterejectedbycompany" =>
+                            x.FinalOutcome == "Rejected",
+                        _ => NormalizeFilter(x.OnboardingStatus) == statusFilter ||
+                             NormalizeFilter(x.DocumentStatus) == statusFilter ||
+                             NormalizeFilter(x.OfferStatus) == statusFilter ||
+                             NormalizeFilter(x.OnboardedStatus) == statusFilter
+                    }).ToList();
+                }
+
+                string? search = request.Search?.Trim();
+                if (!string.IsNullOrWhiteSpace(search))
+                {
+                    data = data.Where(x =>
+                        MatchesSearch(x.CandidateName, search) ||
+                        MatchesSearch(x.JobTitle, search) ||
+                        MatchesSearch(x.DepartmentName, search) ||
+                        MatchesSearch(x.BranchName, search) ||
+                        MatchesSearch(x.OnboardingStatus, search) ||
+                        MatchesSearch(x.DocumentStatus, search) ||
+                        MatchesSearch(x.DocumentStatusText, search) ||
+                        MatchesSearch(x.OfferStatus, search) ||
+                        MatchesSearch(x.OnboardedStatus, search) ||
+                        MatchesSearch(x.FinalDecisionText, search)
+                    ).ToList();
+                }
+
+                // Joining date means actual date when present, otherwise expected date.
+                // Do not substitute AppliedOn for a missing joining date.
+                if (request.JoiningFrom.HasValue)
+                {
+                    var fromDate = request.JoiningFrom.Value.Date;
+                    data = data.Where(x =>
+                    {
+                        DateTime? joiningDate = x.ActualJoiningDate ?? x.ExpectedJoiningDate;
+                        return joiningDate.HasValue && joiningDate.Value.Date >= fromDate;
+                    }).ToList();
+                }
+
+                if (request.JoiningTo.HasValue)
+                {
+                    var toDate = request.JoiningTo.Value.Date;
+                    data = data.Where(x =>
+                    {
+                        DateTime? joiningDate = x.ActualJoiningDate ?? x.ExpectedJoiningDate;
+                        return joiningDate.HasValue && joiningDate.Value.Date <= toDate;
+                    }).ToList();
+                }
 
                 return Ok(new
                 {
                     Status = true,
                     Message = data.Count > 0
                         ? "Onboarding candidates fetched successfully."
-                        : "No fully approved candidates found within your scope.",
+                        : "No candidates with last-hierarchy or admin approval found within your scope.",
                     request.CompanyId,
                     request.UserId,
                     IsAdmin = isAdmin,
@@ -1217,7 +4177,11 @@ public class GetOnboardingCandidateListRequest
                         TotalCandidate = data.Count,
                         VerifiedCandidate = data.Count(x => x.IsVerified),
                         PendingCandidate = data.Count(x => x.IsPending),
-                        JoinedCandidate = data.Count(x => x.IsJoined)
+                        JoinedCandidate = data.Count(x => x.IsJoined),
+                        OfferDeclinedByCandidate = data.Count(x =>
+                            x.FinalOutcome == "OfferDeclined"),
+                        CandidateRejectedByCompany = data.Count(x =>
+                            x.FinalOutcome == "Rejected")
                     },
                     TotalCount = data.Count,
                     Data = data
@@ -1231,418 +4195,6 @@ public class GetOnboardingCandidateListRequest
                 return Fail(500, "Unable to fetch onboarding candidates.");
             }
         }
-
-
-
-
-
-
-
-      
-
-// DTOs go outside your controller.
-
-
-//// Place INSIDE your existing controller.
-//[HttpPost("SaveOnboardingDocument")]
-//        public async Task<IActionResult> SaveOnboardingDocument([FromBody] SaveOnboardingDocumentRequest? request)
-//        {
-//            IActionResult Fail(int code, string message) =>
-//                StatusCode(code, new { Status = false, Message = message });
-
-//            if (request == null || request.CompanyId <= 0 || request.UserId <= 0 ||
-//                request.CandidateId <= 0 || request.JobDescriptionId <= 0 ||
-//                request.CandidateApplicationId < 0)
-//                return Fail(400, "Provide valid company, user, candidate and job IDs.");
-
-//            if (request.Documents == null || request.Documents.Count == 0)
-//                return Fail(400, "At least one document request is required.");
-
-//            foreach (var item in request.Documents)
-//            {
-//                if (item == null)
-//                    return Fail(400, "Document request cannot be null.");
-//                if (item.CandidateOnboardingDocumentId < 0)
-//                    return Fail(400, "Invalid document ID.");
-//                if (item.AllocatedDays <= 0 || item.AllocatedDays > 365)
-//                    return Fail(400, "AllocatedDays must be between 1 and 365.");
-
-//                item.DocumentName = item.DocumentName?.Trim();
-//                item.Instructions = item.Instructions?.Trim();
-
-//                if (string.IsNullOrWhiteSpace(item.DocumentName))
-//                    return Fail(400, "DocumentName is required.");
-//                if (item.DocumentName?.Length > 200)
-//                    return Fail(400, "DocumentName cannot exceed 200 characters.");
-//                if (item.CandidateOnboardingDocumentId > 0 &&
-//                    (item.RowVersion == null || item.RowVersion.Length != 8))
-//                    return Fail(400, "Send the current RowVersion when editing a document request.");
-//            }
-
-//            if (request.Documents.Where(x => x.CandidateOnboardingDocumentId > 0)
-//                .GroupBy(x => x.CandidateOnboardingDocumentId).Any(g => g.Count() > 1))
-//                return Fail(400, "A document request ID cannot repeat.");
-
-//            try
-//            {
-//                await using var transaction = await _context.Database
-//                    .BeginTransactionAsync(IsolationLevel.Serializable);
-
-//                var user = await _context.EmployeeMasters.AsNoTracking()
-//                    .FirstOrDefaultAsync(x => x.CompanyId == request.CompanyId &&
-//                        x.EmployeeId == request.UserId);
-//                if (user == null) return Fail(404, "Employee not found for this company.");
-//                if (user.IsActive != true) return Fail(403, "Employee is inactive.");
-
-//                var candidatesExist = await _context.Candidates.AsNoTracking()
-//                    .AnyAsync(x => x.CompanyId == request.CompanyId &&
-//                        x.CandidateId == request.CandidateId && x.IsActive == true);
-//                if (!candidatesExist) return Fail(404, "Active candidate not found.");
-
-//                var job = await _context.JobDescriptions.AsNoTracking()
-//                    .FirstOrDefaultAsync(x => x.CompanyId == request.CompanyId &&
-//                        x.JobDescriptionId == request.JobDescriptionId);
-//                if (job == null) return Fail(404, "Job not found for this company.");
-
-//                int? templateId = job.TemplateId;
-//                if (!templateId.HasValue || !await _context.RoleTemplates.AsNoTracking()
-//                    .AnyAsync(x => x.CompanyId == request.CompanyId &&
-//                        x.TemplateId == templateId.Value && x.IsActive == true))
-//                    return Fail(409, "The job must have an active recruitment template.");
-
-//                var applicationsQuery = _context.CandidateApplications.Where(x =>
-//                    x.CompanyId == request.CompanyId &&
-//                    x.CandidateId == request.CandidateId &&
-//                    x.JobDescriptionId == request.JobDescriptionId);
-//                if (request.CandidateApplicationId > 0)
-//                    applicationsQuery = applicationsQuery.Where(x =>
-//                        x.CandidateApplicationId == request.CandidateApplicationId);
-//                var applications = await applicationsQuery.Take(2).ToListAsync();
-//                if (applications.Count == 0) return Fail(404, "Candidate application not found.");
-//                if (applications.Count > 1)
-//                    return Fail(409, "Multiple applications exist. Send CandidateApplicationId.");
-//                var application = applications[0];
-//                if (application.IsActive != true)
-//                    return Fail(409, "Candidate application is inactive.");
-
-//                if (user.IsAdmin != true)
-//                {
-//                    var teamIds = await (
-//                        from member in _context.OnboardingTeamMembers.AsNoTracking()
-//                        join team in _context.OnboardingTeams.AsNoTracking()
-//                            on new { member.CompanyId, member.OnboardingTeamId }
-//                            equals new { team.CompanyId, team.OnboardingTeamId }
-//                        where member.CompanyId == request.CompanyId &&
-//                            member.EmployeeId == request.UserId &&
-//                            member.IsActive && team.IsActive
-//                        select team.OnboardingTeamId
-//                    ).Distinct().ToListAsync();
-//                    var scopes = await _context.OnboardingTeamTemplates.AsNoTracking()
-//                        .Where(x => x.CompanyId == request.CompanyId &&
-//                            teamIds.Contains(x.OnboardingTeamId)).ToListAsync();
-//                    bool allowed = teamIds.Any(id =>
-//                        !scopes.Any(x => x.OnboardingTeamId == id) ||
-//                        scopes.Any(x => x.OnboardingTeamId == id &&
-//                            x.TemplateId == templateId.Value));
-//                    if (!allowed)
-//                        return Fail(403, "You are not assigned to onboarding for this template.");
-//                }
-
-//                // Same eligibility rule as GetOnboardingCandidateList.
-//                var assignments = await _context.RoleTemplateAssignment.AsNoTracking()
-//                    .Where(x => x.CompanyId == request.CompanyId &&
-//                        x.TemplateId == templateId.Value && x.IsActive == true &&
-//                        x.CanApprove == true).ToListAsync();
-//                if (assignments.Count == 0)
-//                    return Fail(409, "The template has no active approval assignments.");
-
-//                var assignmentIds = assignments.Select(x => x.AssignmentId).ToArray();
-//                var decisions = await _context.CandidateSkillAssessmentHistories.AsNoTracking()
-//                    .Where(x => x.CompanyId == request.CompanyId &&
-//                        x.CandidateApplicationId == application.CandidateApplicationId &&
-//                        x.JobDescriptionId == request.JobDescriptionId &&
-//                        x.AssignmentId.HasValue && assignmentIds.Contains(x.AssignmentId.Value) &&
-//                        (x.Action == "Approve" || x.Action == "Reject" || x.Action == "Return"))
-//                    .ToListAsync();
-//                if (assignments.Any(a =>
-//                    decisions.Where(x => x.AssignmentId == a.AssignmentId &&
-//                            x.CreatedBy == a.EmployeeId)
-//                        .OrderByDescending(x => x.CreatedOn)
-//                        .ThenByDescending(x => x.CandidateSkillAssessmentHistoryId)
-//                        .FirstOrDefault()?.Action != "Approve"))
-//                    return Fail(409, "All required hierarchy approvals must be completed.");
-
-//                var onboarding = await _context.CandidateOnboardings
-//                    .FirstOrDefaultAsync(x => x.CompanyId == request.CompanyId &&
-//                        x.CandidateApplicationId == application.CandidateApplicationId);
-
-//                if (onboarding != null &&
-//                    (!onboarding.IsActive || !string.IsNullOrWhiteSpace(onboarding.FinalOutcome)))
-//                    return Fail(409, "This onboarding case is inactive or already closed.");
-
-//                // Do not reopen later completed stages by silently adding new requirements.
-//                if (onboarding != null &&
-//                    onboarding.Status != "ReadyForOnboarding" &&
-//                    onboarding.Status != "DocumentsPending")
-//                    return Fail(409, "Document requests can be changed only before advancing beyond the document stage.");
-
-//                var existing = onboarding == null
-//                    ? new List<CandidateOnboardingDocuments>()
-//                    : await _context.CandidateOnboardingDocuments
-//                        .Where(x => x.CompanyId == request.CompanyId &&
-//                            x.CandidateOnboardingId == onboarding.CandidateOnboardingId)
-//                        .ToListAsync();
-//                var existingById = existing.ToDictionary(x => x.CandidateOnboardingDocumentId);
-
-//                foreach (var item in request.Documents)
-//                {
-//                    CandidateOnboardingDocuments? saved = null;
-//                    if (item.CandidateOnboardingDocumentId > 0)
-//                    {
-//                        if (!existingById.TryGetValue(item.CandidateOnboardingDocumentId, out saved))
-//                            return Fail(404, "Document request not found for this onboarding case.");
-//                        if (!saved.IsActive || saved.Status != "Requested")
-//                            return Fail(409, "Only active, unsubmitted document requests can be edited here.");
-//                        if (!saved.RowVersion.SequenceEqual(item.RowVersion!))
-//                            return Fail(409, "Document request changed. Refresh and try again.");
-//                    }
-
-
-//                    if (string.IsNullOrWhiteSpace(item.DocumentName) || item.DocumentName.Length > 200)
-//                        return Fail(400, "Every document must have a valid name up to 200 characters.");
-//                }
-
-//                // Validate the final combined selection. Omitted rows remain unchanged.
-//                var editedIds = request.Documents.Where(x => x.CandidateOnboardingDocumentId > 0)
-//                    .Select(x => x.CandidateOnboardingDocumentId).ToHashSet();
-//                var finalNames = existing.Where(x => x.IsActive && !editedIds.Contains(x.CandidateOnboardingDocumentId))
-//                    .Select(x => x.DocumentName.Trim())
-//                    .Concat(request.Documents.Select(x => x.DocumentName!));
-//                if (finalNames.GroupBy(x => x, StringComparer.OrdinalIgnoreCase).Any(g => g.Count() > 1))
-//                    return Fail(409, "An active request for this document name already exists.");
-
-//                var now = DateTime.UtcNow;
-//                bool isNewOnboarding = onboarding == null;
-//                if (onboarding == null)
-//                {
-//                    onboarding = new CandidateOnboardings
-//                    {
-//                        CompanyId = request.CompanyId,
-//                        CandidateApplicationId = application.CandidateApplicationId,
-//                        TemplateIdAtStart = templateId,
-//                        Status = "ReadyForOnboarding",
-//                        IsActive = true,
-//                        CreatedBy = request.UserId,
-//                        CreatedOn = now
-//                    };
-//                    _context.CandidateOnboardings.Add(onboarding);
-//                    await _context.SaveChangesAsync();
-//                }
-
-//                string Snapshot(CandidateOnboardingDocuments document) =>
-//                    JsonSerializer.Serialize(new
-//                    {
-//                        document.CandidateOnboardingDocumentId,
-//                        document.OnboardingDocumentMasterId,
-//                        document.DocumentName,
-//                        document.IsMandatory,
-//                        document.AllocatedDays,
-//                        document.RequestedOn,
-//                        document.DueOn,
-//                        document.Instructions,
-//                        document.Status,
-//                        document.CurrentSubmissionNumber,
-//                        document.ReceivedFromCandidate,
-//                        document.IsActive
-//                    });
-
-//                var changes = new List<(CandidateOnboardingDocuments Document,
-//                    string? Before, string? OldStatus, string Action)>();
-
-//                foreach (var item in request.Documents)
-//                {
-//                    if (item.CandidateOnboardingDocumentId == 0)
-//                    {
-//                        var document = new CandidateOnboardingDocuments
-//                        {
-//                            CompanyId = request.CompanyId,
-//                            CandidateOnboardingId = onboarding.CandidateOnboardingId,
-//                            OnboardingDocumentMasterId = null,
-//                            DocumentName = item.DocumentName!,
-//                            IsMandatory = item.IsMandatory,
-//                            AllocatedDays = item.AllocatedDays,
-//                            RequestedOn = now,
-//                            RequestedBy = request.UserId,
-//                            DueOn = now.AddDays(item.AllocatedDays),
-//                            Instructions = item.Instructions,
-//                            Status = "Requested",
-//                            CurrentSubmissionNumber = 0,
-//                            ReceivedFromCandidate = false,
-//                            IsActive = true,
-//                            CreatedBy = request.UserId,
-//                            CreatedOn = now
-//                        };
-//                        _context.CandidateOnboardingDocuments.Add(document);
-//                        changes.Add((document, null, null, "DocumentRequested"));
-//                    }
-//                    else
-//                    {
-//                        var document = existingById[item.CandidateOnboardingDocumentId];
-//                        bool daysChanged = document.AllocatedDays != item.AllocatedDays;
-//                        bool changed = daysChanged || document.DocumentName != item.DocumentName ||
-//                            document.IsMandatory != item.IsMandatory ||
-//                            document.Instructions != item.Instructions;
-//                        if (!changed) continue;
-
-//                        string before = Snapshot(document);
-//                        document.DocumentName = item.DocumentName!;
-//                        document.IsMandatory = item.IsMandatory;
-//                        document.Instructions = item.Instructions;
-//                        if (daysChanged)
-//                        {
-//                            // Days are TOTAL calendar days from original request time.
-//                            // Saving an unrelated edit never resets the due date.
-//                            document.AllocatedDays = item.AllocatedDays;
-//                            document.DueOn = document.RequestedOn.AddDays(item.AllocatedDays);
-//                        }
-//                        document.ModifiedBy = request.UserId;
-//                        document.ModifiedOn = now;
-//                        changes.Add((document, before, document.Status, "DocumentRequestUpdated"));
-//                    }
-//                }
-
-//                if (changes.Count > 0)
-//                {
-//                    string oldStatus = onboarding.Status;
-//                    onboarding.Status = "DocumentsPending";
-//                    if (!isNewOnboarding)
-//                    {
-//                        onboarding.ModifiedBy = request.UserId;
-//                        onboarding.ModifiedOn = now;
-//                    }
-//                    await _context.SaveChangesAsync();
-
-//                    foreach (var change in changes)
-//                    {
-//                        _context.CandidateOnboardingHistories.Add(new CandidateOnboardingHistories
-//                        {
-//                            CompanyId = request.CompanyId,
-//                            CandidateOnboardingId = onboarding.CandidateOnboardingId,
-//                            CandidateOnboardingDocumentId = change.Document.CandidateOnboardingDocumentId,
-//                            Action = change.Action,
-//                            PreviousStatus = change.OldStatus,
-//                            NewStatus = change.Document.Status,
-//                            PreviousDetailsJson = change.Before,
-//                            DetailsJson = Snapshot(change.Document),
-//                            IsRemarkAdded = false,
-//                            CreatedBy = request.UserId,
-//                            CreatedOn = now
-//                        });
-//                    }
-//                    if (oldStatus != onboarding.Status)
-//                    {
-//                        _context.CandidateOnboardingHistories.Add(new CandidateOnboardingHistories
-//                        {
-//                            CompanyId = request.CompanyId,
-//                            CandidateOnboardingId = onboarding.CandidateOnboardingId,
-//                            Action = "DocumentStageStarted",
-//                            PreviousStatus = oldStatus,
-//                            NewStatus = onboarding.Status,
-//                            DetailsJson = JsonSerializer.Serialize(new { onboarding.Status }),
-//                            CreatedBy = request.UserId,
-//                            CreatedOn = now
-//                        });
-//                    }
-//                    await _context.SaveChangesAsync();
-//                }
-
-//                var savedDocuments = await _context.CandidateOnboardingDocuments.AsNoTracking()
-//                    .Where(x => x.CompanyId == request.CompanyId &&
-//                        x.CandidateOnboardingId == onboarding.CandidateOnboardingId && x.IsActive)
-//                    .OrderBy(x => x.CandidateOnboardingDocumentId)
-//                    .Select(x => new
-//                    {
-//                        x.CandidateOnboardingDocumentId,
-//                        x.OnboardingDocumentMasterId,
-//                        x.DocumentName,
-//                        x.IsMandatory,
-//                        x.AllocatedDays,
-//                        x.RequestedOn,
-//                        x.RequestedBy,
-//                        x.DueOn,
-//                        x.Instructions,
-//                        x.Status,
-//                        x.CurrentSubmissionNumber,
-//                        x.ReceivedFromCandidate,
-//                        x.CreatedBy,
-//                        x.CreatedOn,
-//                        x.ModifiedBy,
-//                        x.ModifiedOn,
-//                        x.RowVersion
-//                    }).ToListAsync();
-
-//                var history = await _context.CandidateOnboardingHistories.AsNoTracking()
-//                    .Where(x => x.CompanyId == request.CompanyId &&
-//                        x.CandidateOnboardingId == onboarding.CandidateOnboardingId &&
-//                        (x.Action == "DocumentRequested" || x.Action == "DocumentRequestUpdated" ||
-//                         x.Action == "DocumentStageStarted"))
-//                    .OrderByDescending(x => x.CreatedOn)
-//                    .ThenByDescending(x => x.CandidateOnboardingHistoryId)
-//                    .Select(x => new
-//                    {
-//                        x.CandidateOnboardingHistoryId,
-//                        x.CandidateOnboardingDocumentId,
-//                        x.Action,
-//                        x.PreviousStatus,
-//                        x.NewStatus,
-//                        x.PreviousDetailsJson,
-//                        x.DetailsJson,
-//                        x.CreatedBy,
-//                        x.CreatedOn
-//                    }).ToListAsync();
-
-//                await transaction.CommitAsync();
-//                return Ok(new
-//                {
-//                    Status = true,
-//                    Message = changes.Count == 0
-//                        ? "No document request changes were found."
-//                        : "Document requests saved successfully.",
-//                    Data = new
-//                    {
-//                        onboarding.CandidateOnboardingId,
-//                        request.CompanyId,
-//                        request.CandidateId,
-//                        request.JobDescriptionId,
-//                        application.CandidateApplicationId,
-//                        onboarding.Status,
-//                        onboarding.RowVersion,
-//                        ChangedDocumentCount = changes.Count,
-//                        Documents = savedDocuments,
-//                        History = history
-//                    }
-//                });
-//            }
-//            catch (DbUpdateConcurrencyException)
-//            {
-//                return Fail(409, "The record changed. Refresh the latest data and try again.");
-//            }
-//            catch (DbUpdateException ex) when (ex.InnerException is SqlException sql &&
-//                (sql.Number == 2601 || sql.Number == 2627))
-//            {
-//                return Fail(409, "A duplicate onboarding record or document request already exists.");
-//            }
-//            catch (Exception ex)
-//            {
-//                Serilog.Log.Error(ex,
-//                    "Failed to save onboarding document requests for CompanyId {CompanyId}, CandidateId {CandidateId}, JobId {JobId}.",
-//                    request.CompanyId, request.CandidateId, request.JobDescriptionId);
-//                return Fail(500, "Unable to save onboarding document requests.");
-//            }
-//        }
-
-
-
 
         public class GetOnboardingDocumentRequestsRequest
         {
@@ -2730,6 +5282,471 @@ public class GetOnboardingCandidateListRequest
                 return Fail(500, "Unable to save onboarding document requests.");
             }
         }
+
+
+
+
+
+        [HttpPost("ReviewCandidateOnboardingDocument")]
+        public async Task<IActionResult> ReviewCandidateOnboardingDocument(
+            [FromBody] ReviewCandidateOnboardingDocumentRequest? request)
+        {
+            IActionResult Fail(int code, string message) =>
+                StatusCode(code, new
+                {
+                    Status = false,
+                    Message = message
+                });
+
+            if (request == null ||
+                request.CompanyId <= 0 ||
+                request.UserId <= 0 ||
+                request.CandidateId <= 0 ||
+                request.JobDescriptionId <= 0 ||
+                request.CandidateApplicationId <= 0 ||
+                request.CandidateOnboardingDocumentId <= 0)
+            {
+                return Fail(400, "Provide valid reference IDs.");
+            }
+
+            string? action = request.Action?.Trim().ToLowerInvariant() switch
+            {
+                "approve" or "approved" => "Approve",
+                "reject" or "rejected" => "Reject",
+                "return" or "returned" => "Return",
+                _ => null
+            };
+
+            if (action == null)
+                return Fail(400, "Action must be Approve, Reject or Return.");
+
+            var remarks = string.IsNullOrWhiteSpace(request.Remarks)
+                ? null
+                : request.Remarks.Trim();
+
+            if (remarks?.Length > 4000)
+                return Fail(400, "Remarks cannot exceed 4000 characters.");
+
+            if (action != "Approve" && remarks == null)
+                return Fail(400, "Remarks are required for Reject or Return.");
+
+            try
+            {
+                await using var transaction =
+                    await _context.Database.BeginTransactionAsync(
+                        System.Data.IsolationLevel.Serializable);
+
+                var user = await _context.EmployeeMasters
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.EmployeeId == request.UserId);
+
+                if (user == null)
+                    return Fail(404, "Employee not found for this company.");
+
+                if (user.IsActive != true)
+                    return Fail(403, "Employee is inactive.");
+
+                var application = await _context.CandidateApplications
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.CandidateApplicationId == request.CandidateApplicationId &&
+                        x.CandidateId == request.CandidateId &&
+                        x.JobDescriptionId == request.JobDescriptionId);
+
+                if (application == null)
+                    return Fail(404, "Matching candidate application not found.");
+
+                if (application.IsActive != true)
+                    return Fail(409, "Candidate application is inactive.");
+
+                var candidate = await _context.Candidates
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.CandidateId == request.CandidateId);
+
+                if (candidate == null)
+                    return Fail(404, "Candidate not found.");
+
+                var job = await _context.JobDescriptions
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.JobDescriptionId == request.JobDescriptionId);
+
+                if (job == null)
+                    return Fail(404, "Job not found.");
+
+                int? templateId = job.TemplateId;
+
+                if (!templateId.HasValue ||
+                    !await _context.RoleTemplates.AsNoTracking().AnyAsync(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.TemplateId == templateId.Value &&
+                        x.IsActive == true))
+                {
+                    return Fail(409, "The job must have an active template.");
+                }
+
+                // Review access is separate from notification routing.
+                if (user.IsAdmin != true)
+                {
+                    var teamIds = await (
+                        from member in _context.OnboardingTeamMembers.AsNoTracking()
+
+                        join team in _context.OnboardingTeams.AsNoTracking()
+                            on new
+                            {
+                                member.CompanyId,
+                                member.OnboardingTeamId
+                            }
+                            equals new
+                            {
+                                team.CompanyId,
+                                team.OnboardingTeamId
+                            }
+
+                        where member.CompanyId == request.CompanyId &&
+                              member.EmployeeId == request.UserId &&
+                              member.IsActive == true &&
+                              team.IsActive == true
+
+                        select team.OnboardingTeamId
+                    ).Distinct().ToListAsync();
+
+                    var mappings = await _context.OnboardingTeamTemplates
+                        .AsNoTracking()
+                        .Where(x =>
+                            x.CompanyId == request.CompanyId &&
+                            teamIds.Contains(x.OnboardingTeamId))
+                        .ToListAsync();
+
+                    bool hasAccess = teamIds.Any(teamId =>
+                        !mappings.Any(x => x.OnboardingTeamId == teamId) ||
+                        mappings.Any(x =>
+                            x.OnboardingTeamId == teamId &&
+                            x.TemplateId == templateId.Value));
+
+                    if (!hasAccess)
+                    {
+                        return Fail(
+                            403,
+                            "You are not assigned to onboarding for this template.");
+                    }
+                }
+
+                var onboarding = await _context.CandidateOnboardings
+                    .AsTracking()
+                    .FirstOrDefaultAsync(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.CandidateApplicationId == request.CandidateApplicationId);
+
+                if (onboarding == null)
+                    return Fail(404, "Onboarding record not found.");
+
+                if (!onboarding.IsActive ||
+                    !string.IsNullOrWhiteSpace(onboarding.FinalOutcome))
+                {
+                    return Fail(409, "The onboarding case is inactive or closed.");
+                }
+
+                var document = await _context.CandidateOnboardingDocuments
+                    .AsTracking()
+                    .FirstOrDefaultAsync(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.CandidateOnboardingId == onboarding.CandidateOnboardingId &&
+                        x.CandidateOnboardingDocumentId ==
+                            request.CandidateOnboardingDocumentId);
+
+                if (document == null)
+                {
+                    return Fail(
+                        404,
+                        "Document not found for this candidate application.");
+                }
+
+                if (!document.IsActive)
+                    return Fail(409, "Document is inactive.");
+
+                if (string.IsNullOrWhiteSpace(document.FileStorageKey))
+                    return Fail(409, "Upload the document before reviewing it.");
+
+                // Select notification recipients from the job's template.
+                // The reviewer does not need to belong to these assignments.
+                var recipientAssignments = await (
+                    from assignment in _context.RoleTemplateAssignment.AsNoTracking()
+
+                    join employee in _context.EmployeeMasters.AsNoTracking()
+                        on new
+                        {
+                            assignment.CompanyId,
+                            assignment.EmployeeId
+                        }
+                        equals new
+                        {
+                            employee.CompanyId,
+                            employee.EmployeeId
+                        }
+
+                    where action != "Approve" &&
+                          assignment.CompanyId == request.CompanyId &&
+                          assignment.TemplateId == templateId.Value &&
+                          assignment.IsActive == true &&
+                          employee.IsActive == true &&
+                          employee.EmployeeId != request.UserId
+
+                    select new
+                    {
+                        assignment.AssignmentId,
+                        assignment.EmployeeId
+                    }
+                ).ToListAsync();
+
+                // One notification per employee, even with multiple assignments.
+                var recipients = recipientAssignments
+                    .GroupBy(x => x.EmployeeId)
+                    .Select(group => group
+                        .OrderBy(x => x.AssignmentId)
+                        .First())
+                    .ToList();
+
+                var now = DateTime.UtcNow;
+
+                string newStatus = action switch
+                {
+                    "Approve" => "Approved",
+                    "Reject" => "Rejected",
+                    _ => "Return"
+                };
+
+                string Snapshot() =>
+                    System.Text.Json.JsonSerializer.Serialize(new
+                    {
+                        document.CandidateOnboardingDocumentId,
+                        document.DocumentName,
+                        File = document.FileStorageKey,
+                        document.Status,
+                        document.ReviewRemarks,
+                        document.ReviewedBy,
+                        document.ReviewedOn,
+                        document.VerifiedBy,
+                        document.VerifiedOn
+                    });
+
+                var before = Snapshot();
+                var previousStatus = document.Status;
+
+                document.Status = newStatus;
+                document.ReviewRemarks = remarks;
+                document.ReviewedBy = request.UserId;
+                document.ReviewedOn = now;
+                document.ModifiedBy = request.UserId;
+                document.ModifiedOn = now;
+
+                document.VerifiedBy = action == "Approve"
+                    ? request.UserId
+                    : (int?)null;
+
+                document.VerifiedOn = action == "Approve"
+                    ? now
+                    : (DateTime?)null;
+
+                onboarding.ModifiedBy = request.UserId;
+                onboarding.ModifiedOn = now;
+
+                var history = new CandidateOnboardingHistories
+                {
+                    CompanyId = request.CompanyId,
+                    CandidateOnboardingId = onboarding.CandidateOnboardingId,
+                    CandidateOnboardingDocumentId =
+                        document.CandidateOnboardingDocumentId,
+
+                    Action = action,
+                    PreviousStatus = previousStatus,
+                    NewStatus = newStatus,
+
+                    PreviousDetailsJson = before,
+                    DetailsJson = Snapshot(),
+
+                    Remarks = remarks,
+                    IsRemarkAdded = remarks != null,
+
+                    CreatedBy = request.UserId,
+                    CreatedOn = now
+                };
+
+                _context.CandidateOnboardingHistories.Add(history);
+
+                await _context.SaveChangesAsync();
+
+                string reviewerName =
+                    ((user.FirstName ?? "") + " " + (user.LastName ?? "")).Trim();
+
+                string candidateName = string.Join(
+                    " ",
+                    new[]
+                    {
+                candidate.FirstName,
+                candidate.MiddleName,
+                candidate.LastName
+                    }.Where(x => !string.IsNullOrWhiteSpace(x)));
+
+                // Uses the actual entity type configured in your DbSet.
+                static T NewEntity<T>(
+                    Microsoft.EntityFrameworkCore.DbSet<T> set)
+                    where T : class, new() => new T();
+
+                foreach (var recipient in recipients)
+                {
+                    var notification =
+                        NewEntity(_context.RecruitmentNotifications);
+
+                    notification.CompanyId = request.CompanyId;
+
+                    // Actual reviewer is the sender.
+                    notification.FromUserId = request.UserId;
+                    notification.ToUserId = recipient.EmployeeId;
+
+                    notification.CandidateApplicationId =
+                        application.CandidateApplicationId;
+
+                    notification.JobDescriptionId = request.JobDescriptionId;
+                    notification.TemplateId = templateId.Value;
+
+                    // Reviewer may have no recruitment-template assignment.
+                    notification.FromAssignmentId = null;
+                    notification.ToAssignmentId = recipient.AssignmentId;
+
+                    notification.CompanySkillMasterId = 0;
+                    notification.CandidateSkillAssessmentHistoryId = 0;
+
+                    notification.CandidateOnboardingDocumentId =
+                        document.CandidateOnboardingDocumentId;
+
+                    notification.CandidateOnboardingHistoryId =
+                        history.CandidateOnboardingHistoryId;
+
+                    notification.Action = action;
+                    notification.Type = "OnboardingDocument";
+
+                    notification.Title = action == "Reject"
+                        ? "Candidate document rejected"
+                        : "Candidate document returned";
+
+                    notification.Message =
+                        $"{candidateName}'s document '{document.DocumentName}' " +
+                        $"was {(action == "Reject" ? "rejected" : "returned")} " +
+                        $"by {reviewerName} for job '{job.JobTitle}'. " +
+                        $"Remarks: {remarks}";
+
+                    notification.IsRead = false;
+                    notification.CreatedOn = now;
+
+                    // Informational notification, not a skill-assessment action request.
+                    notification.IsActionRequest = false;
+                    notification.DeliveryStatus = "NotRequired";
+                    notification.DeliveryAttempts = 0;
+
+                    _context.RecruitmentNotifications.Add(notification);
+                }
+
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+                return Ok(new
+                {
+                    Status = true,
+                    Message = "Document review saved successfully.",
+
+                    Data = new
+                    {
+                        request.CompanyId,
+                        request.CandidateId,
+                        request.JobDescriptionId,
+                        request.CandidateApplicationId,
+
+                        document.CandidateOnboardingDocumentId,
+                        document.DocumentName,
+
+                        File = document.FileStorageKey,
+                        document.Status,
+                        document.ReviewRemarks,
+
+                        document.ReviewedBy,
+                        ReviewedByName = reviewerName,
+                        document.ReviewedOn,
+
+                        document.VerifiedBy,
+                        document.VerifiedOn,
+
+                        history.CandidateOnboardingHistoryId,
+
+                        NotificationCount = recipients.Count,
+                        NotifiedEmployeeIds = recipients
+                            .Select(x => x.EmployeeId)
+                            .ToList()
+                    }
+                });
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                return Fail(
+                    409,
+                    "The document changed. Refresh and try again.");
+            }
+            catch (Exception ex)
+            {
+                Serilog.Log.Error(
+                    ex,
+                    "Failed to review onboarding document {DocumentId} " +
+                    "for CompanyId {CompanyId}, ApplicationId {ApplicationId}.",
+                    request.CandidateOnboardingDocumentId,
+                    request.CompanyId,
+                    request.CandidateApplicationId);
+
+                return Fail(
+                    500,
+                    "Unable to save document review.");
+            }
+        }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        public class ReviewCandidateOnboardingDocumentRequest
+        {
+            public int CompanyId { get; set; }
+            public int UserId { get; set; }
+            public int CandidateId { get; set; }
+            public int JobDescriptionId { get; set; }
+            public int CandidateApplicationId { get; set; }
+            public int CandidateOnboardingDocumentId { get; set; }
+
+            // Approve / Approved, Reject / Rejected, Return / Returned
+            public string? Action { get; set; }
+
+            public string? Remarks { get; set; }
+        }
+
+
 
 
         // Replace your existing DTOs with these; do not add duplicate classes.
@@ -3918,6 +6935,9 @@ public class GetOnboardingCandidateListRequest
                 return Fail(500, "Unable to fetch company documents.");
             }
         }
+
+
+
         [HttpPost("GetCandidateOnboardingDocuments")]
         public async Task<IActionResult> GetCandidateOnboardingDocuments(
     [FromBody] GetCandidateOnboardingDocumentsRequest? request)
@@ -4101,9 +7121,9 @@ public class GetOnboardingCandidateListRequest
                     " ",
                     new[]
                     {
-                candidate.FirstName,
-                candidate.MiddleName,
-                candidate.LastName
+                    candidate.FirstName,
+                    candidate.MiddleName,
+                    candidate.LastName
                     }.Where(x => !string.IsNullOrWhiteSpace(x)));
 
                 if (onboarding == null)
@@ -4128,6 +7148,9 @@ public class GetOnboardingCandidateListRequest
                         RequestedCount = 0,
                         SubmittedCount = 0,
                         VerifiedCount = 0,
+                        ApprovedCount = 0,
+                        RejectedCount = 0,
+                        ReturnCount = 0,
                         ResubmissionRequiredCount = 0,
                         OverdueCount = 0,
 
@@ -4165,12 +7188,13 @@ public class GetOnboardingCandidateListRequest
                 var employeeIds = documents
                     .SelectMany(x => new int?[]
                     {
-                x.RequestedBy,
-                x.ReceivedBy,
-                x.SubmittedBy,
-                x.VerifiedBy,
-                x.CreatedBy,
-                x.ModifiedBy
+                    x.RequestedBy,
+                    x.ReceivedBy,
+                    x.SubmittedBy,
+                    x.VerifiedBy,
+                    x.ReviewedBy,
+                    x.CreatedBy,
+                    x.ModifiedBy
                     })
                     .Concat(histories.Select(x => (int?)x.CreatedBy))
                     .Where(x => x.HasValue)
@@ -4259,6 +7283,9 @@ public class GetOnboardingCandidateListRequest
                         GetEmployeeName(document.VerifiedBy),
 
                     document.ReviewRemarks,
+                    document.ReviewedBy,
+                    ReviewedByName = GetEmployeeName(document.ReviewedBy),
+                    document.ReviewedOn,
                     document.DetailsJson,
 
                     document.CreatedOn,
@@ -4316,7 +7343,11 @@ public class GetOnboardingCandidateListRequest
                     TotalCount = data.Count,
                     RequestedCount = data.Count(x => x.Status == "Requested"),
                     SubmittedCount = data.Count(x => x.Status == "Submitted"),
-                    VerifiedCount = data.Count(x => x.Status == "Verified"),
+                    VerifiedCount = data.Count(x =>
+                        x.Status == "Verified" || x.Status == "Approved"),
+                    ApprovedCount = data.Count(x => x.Status == "Approved"),
+                    RejectedCount = data.Count(x => x.Status == "Rejected"),
+                    ReturnCount = data.Count(x => x.Status == "Return"),
                     ResubmissionRequiredCount = data.Count(x =>
                         x.Status == "ResubmissionRequired"),
                     OverdueCount = data.Count(x => x.IsOverdue),
@@ -4337,12 +7368,430 @@ public class GetOnboardingCandidateListRequest
             }
         }
 
+        //    [HttpPost("GetCandidateOnboardingDocuments")]
+        //    public async Task<IActionResult> GetCandidateOnboardingDocuments(
+        //[FromBody] GetCandidateOnboardingDocumentsRequest? request)
+        //    {
+        //        IActionResult Fail(int code, string message) =>
+        //            StatusCode(code, new
+        //            {
+        //                Status = false,
+        //                Message = message
+        //            });
+
+        //        if (request == null ||
+        //            request.CompanyId <= 0 ||
+        //            request.UserId <= 0 ||
+        //            request.CandidateId <= 0 ||
+        //            request.JobDescriptionId <= 0 ||
+        //            request.CandidateApplicationId < 0)
+        //        {
+        //            return Fail(
+        //                400,
+        //                "Provide valid company, user, candidate and job IDs.");
+        //        }
+
+        //        try
+        //        {
+        //            var user = await _context.EmployeeMasters
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.EmployeeId == request.UserId)
+        //                .Select(x => new
+        //                {
+        //                    x.IsActive,
+        //                    x.IsAdmin
+        //                })
+        //                .FirstOrDefaultAsync();
+
+        //            if (user == null)
+        //                return Fail(404, "Employee not found for this company.");
+
+        //            if (user.IsActive != true)
+        //                return Fail(403, "Employee is inactive.");
+
+        //            var candidate = await _context.Candidates
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.CandidateId == request.CandidateId)
+        //                .Select(x => new
+        //                {
+        //                    x.FirstName,
+        //                    x.MiddleName,
+        //                    x.LastName
+        //                })
+        //                .FirstOrDefaultAsync();
+
+        //            if (candidate == null)
+        //                return Fail(404, "Candidate not found for this company.");
+
+        //            var job = await _context.JobDescriptions
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.JobDescriptionId == request.JobDescriptionId)
+        //                .Select(x => new
+        //                {
+        //                    x.JobTitle,
+        //                    TemplateId = (int?)x.TemplateId
+        //                })
+        //                .FirstOrDefaultAsync();
+
+        //            if (job == null)
+        //                return Fail(404, "Job not found for this company.");
+
+        //            var applicationQuery = _context.CandidateApplications
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.CandidateId == request.CandidateId &&
+        //                    x.JobDescriptionId == request.JobDescriptionId);
+
+        //            if (request.CandidateApplicationId > 0)
+        //            {
+        //                applicationQuery = applicationQuery.Where(x =>
+        //                    x.CandidateApplicationId ==
+        //                        request.CandidateApplicationId);
+        //            }
+
+        //            var applications = await applicationQuery
+        //                .Select(x => x.CandidateApplicationId)
+        //                .Take(2)
+        //                .ToListAsync();
+
+        //            if (applications.Count == 0)
+        //                return Fail(404, "Candidate application not found.");
+
+        //            if (applications.Count > 1)
+        //            {
+        //                return Fail(
+        //                    409,
+        //                    "Multiple applications exist. Send CandidateApplicationId.");
+        //            }
+
+        //            int applicationId = applications[0];
+
+        //            if (user.IsAdmin != true)
+        //            {
+        //                var teamIds = await (
+        //                    from member in _context.OnboardingTeamMembers
+        //                        .AsNoTracking()
+
+        //                    join team in _context.OnboardingTeams
+        //                        .AsNoTracking()
+        //                        on new
+        //                        {
+        //                            member.CompanyId,
+        //                            member.OnboardingTeamId
+        //                        }
+        //                        equals new
+        //                        {
+        //                            team.CompanyId,
+        //                            team.OnboardingTeamId
+        //                        }
+
+        //                    where member.CompanyId == request.CompanyId
+        //                          && member.EmployeeId == request.UserId
+        //                          && member.IsActive
+        //                          && team.IsActive
+
+        //                    select team.OnboardingTeamId
+        //                )
+        //                .Distinct()
+        //                .ToListAsync();
+
+        //                var mappings = await _context.OnboardingTeamTemplates
+        //                    .AsNoTracking()
+        //                    .Where(x =>
+        //                        x.CompanyId == request.CompanyId &&
+        //                        teamIds.Contains(x.OnboardingTeamId))
+        //                    .Select(x => new
+        //                    {
+        //                        x.OnboardingTeamId,
+        //                        x.TemplateId
+        //                    })
+        //                    .ToListAsync();
+
+        //                bool hasAccess = teamIds.Any(teamId =>
+        //                    // No template mappings means all company templates.
+        //                    !mappings.Any(x =>
+        //                        x.OnboardingTeamId == teamId)
+        //                    ||
+        //                    (
+        //                        job.TemplateId.HasValue &&
+        //                        mappings.Any(x =>
+        //                            x.OnboardingTeamId == teamId &&
+        //                            x.TemplateId == job.TemplateId.Value)
+        //                    ));
+
+        //                if (!hasAccess)
+        //                {
+        //                    return Fail(
+        //                        403,
+        //                        "You are not assigned to onboarding for this candidate's template.");
+        //                }
+        //            }
+
+        //            var onboarding = await _context.CandidateOnboardings
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.CandidateApplicationId == applicationId)
+        //                .Select(x => new
+        //                {
+        //                    x.CandidateOnboardingId,
+        //                    x.Status,
+        //                    x.IsActive
+        //                })
+        //                .FirstOrDefaultAsync();
+
+        //            string candidateName = string.Join(
+        //                " ",
+        //                new[]
+        //                {
+        //                candidate.FirstName,
+        //                candidate.MiddleName,
+        //                candidate.LastName
+        //                }.Where(x => !string.IsNullOrWhiteSpace(x)));
+
+        //            if (onboarding == null)
+        //            {
+        //                return Ok(new
+        //                {
+        //                    Status = true,
+        //                    Message = "No candidate document requests found.",
+
+        //                    request.CompanyId,
+        //                    request.CandidateId,
+        //                    CandidateName = candidateName,
+        //                    request.JobDescriptionId,
+        //                    job.JobTitle,
+        //                    CandidateApplicationId = applicationId,
+
+        //                    CandidateOnboardingId = (int?)null,
+        //                    OnboardingStatus = (string?)null,
+        //                    OnboardingIsActive = (bool?)null,
+
+        //                    TotalCount = 0,
+        //                    RequestedCount = 0,
+        //                    SubmittedCount = 0,
+        //                    VerifiedCount = 0,
+        //                    ResubmissionRequiredCount = 0,
+        //                    OverdueCount = 0,
+
+        //                    Data = Array.Empty<object>()
+        //                });
+        //            }
+
+        //            var documents = await _context.CandidateOnboardingDocuments
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.CandidateOnboardingId ==
+        //                        onboarding.CandidateOnboardingId &&
+        //                    x.IsActive)
+        //                .OrderBy(x => x.CandidateOnboardingDocumentId)
+        //                .ToListAsync();
+
+        //            var documentIds = documents
+        //                .Select(x => x.CandidateOnboardingDocumentId)
+        //                .ToArray();
+
+        //            var histories = await _context.CandidateOnboardingHistories
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    x.CandidateOnboardingId ==
+        //                        onboarding.CandidateOnboardingId &&
+        //                    x.CandidateOnboardingDocumentId.HasValue &&
+        //                    documentIds.Contains(
+        //                        x.CandidateOnboardingDocumentId.Value))
+        //                .OrderByDescending(x => x.CreatedOn)
+        //                .ThenByDescending(x => x.CandidateOnboardingHistoryId)
+        //                .ToListAsync();
+
+        //            var employeeIds = documents
+        //                .SelectMany(x => new int?[]
+        //                {
+        //                x.RequestedBy,
+        //                x.ReceivedBy,
+        //                x.SubmittedBy,
+        //                x.VerifiedBy,
+        //                x.CreatedBy,
+        //                x.ModifiedBy
+        //                })
+        //                .Concat(histories.Select(x => (int?)x.CreatedBy))
+        //                .Where(x => x.HasValue)
+        //                .Select(x => x!.Value)
+        //                .Distinct()
+        //                .ToArray();
+
+        //            var employeeNames = await _context.EmployeeMasters
+        //                .AsNoTracking()
+        //                .Where(x =>
+        //                    x.CompanyId == request.CompanyId &&
+        //                    employeeIds.Contains(x.EmployeeId))
+        //                .Select(x => new
+        //                {
+        //                    x.EmployeeId,
+        //                    Name = ((x.FirstName ?? "") + " " +
+        //                            (x.LastName ?? "")).Trim()
+        //                })
+        //                .ToDictionaryAsync(x => x.EmployeeId, x => x.Name);
+
+        //            string? GetEmployeeName(int? employeeId)
+        //            {
+        //                return employeeId.HasValue &&
+        //                       employeeNames.TryGetValue(
+        //                           employeeId.Value, out var name)
+        //                    ? name
+        //                    : null;
+        //            }
+
+        //            var historiesByDocument = histories.ToLookup(x =>
+        //                x.CandidateOnboardingDocumentId!.Value);
+
+        //            var now = DateTime.UtcNow;
+
+        //            var data = documents.Select(document => new
+        //            {
+        //                document.CandidateOnboardingDocumentId,
+        //                document.CandidateOnboardingId,
+        //                document.OnboardingDocumentMasterId,
+        //                document.CompanyId,
+
+        //                request.CandidateId,
+        //                request.JobDescriptionId,
+        //                CandidateApplicationId = applicationId,
+
+        //                document.DocumentName,
+        //                document.IsMandatory,
+        //                document.AllocatedDays,
+        //                document.Instructions,
+
+        //                // Existing stored file reference; not a generated download URL.
+        //                File = document.FileStorageKey,
+
+        //                document.Status,
+        //                document.CurrentSubmissionNumber,
+        //                document.IsActive,
+
+        //                document.RequestedOn,
+        //                document.RequestedBy,
+        //                RequestedByName =
+        //                    GetEmployeeName(document.RequestedBy),
+
+        //                document.DueOn,
+
+        //                IsOverdue =
+        //                    document.DueOn < now &&
+        //                    (
+        //                        document.Status == "Requested" ||
+        //                        document.Status == "ResubmissionRequired"
+        //                    ),
+
+        //                document.ReceivedFromCandidate,
+        //                document.ReceivedOn,
+        //                document.ReceivedBy,
+        //                ReceivedByName =
+        //                    GetEmployeeName(document.ReceivedBy),
+
+        //                document.SubmittedOn,
+        //                document.SubmittedBy,
+        //                SubmittedByName =
+        //                    GetEmployeeName(document.SubmittedBy),
+
+        //                document.VerifiedOn,
+        //                document.VerifiedBy,
+        //                VerifiedByName =
+        //                    GetEmployeeName(document.VerifiedBy),
+
+        //                document.ReviewRemarks,
+        //                document.DetailsJson,
+
+        //                document.CreatedOn,
+        //                document.CreatedBy,
+        //                CreatedByName =
+        //                    GetEmployeeName(document.CreatedBy),
+
+        //                document.ModifiedOn,
+        //                document.ModifiedBy,
+        //                ModifiedByName =
+        //                    GetEmployeeName(document.ModifiedBy),
+
+        //                // Use this document's RowVersion in the edit request.
+        //                document.RowVersion,
+
+        //                History = historiesByDocument[
+        //                    document.CandidateOnboardingDocumentId]
+        //                    .Select(history => new
+        //                    {
+        //                        history.CandidateOnboardingHistoryId,
+        //                        history.CandidateOnboardingDocumentId,
+        //                        history.Action,
+        //                        history.PreviousStatus,
+        //                        history.NewStatus,
+        //                        history.PreviousDetailsJson,
+        //                        history.DetailsJson,
+        //                        history.Remarks,
+        //                        history.IsRemarkAdded,
+        //                        history.CreatedBy,
+        //                        CreatedByName =
+        //                            GetEmployeeName(history.CreatedBy),
+        //                        history.CreatedOn
+        //                    })
+        //                    .ToList()
+        //            }).ToList();
+
+        //            return Ok(new
+        //            {
+        //                Status = true,
+        //                Message = data.Count > 0
+        //                    ? "Candidate documents fetched successfully."
+        //                    : "No candidate document requests found.",
+
+        //                request.CompanyId,
+        //                request.CandidateId,
+        //                CandidateName = candidateName,
+        //                request.JobDescriptionId,
+        //                job.JobTitle,
+        //                CandidateApplicationId = applicationId,
+
+        //                onboarding.CandidateOnboardingId,
+        //                OnboardingStatus = onboarding.Status,
+        //                OnboardingIsActive = onboarding.IsActive,
+
+        //                TotalCount = data.Count,
+        //                RequestedCount = data.Count(x => x.Status == "Requested"),
+        //                SubmittedCount = data.Count(x => x.Status == "Submitted"),
+        //                VerifiedCount = data.Count(x => x.Status == "Verified"),
+        //                ResubmissionRequiredCount = data.Count(x =>
+        //                    x.Status == "ResubmissionRequired"),
+        //                OverdueCount = data.Count(x => x.IsOverdue),
+
+        //                Data = data
+        //            });
+        //        }
+        //        catch (Exception ex)
+        //        {
+        //            Serilog.Log.Error(
+        //                ex,
+        //                "Failed to fetch candidate onboarding documents for CompanyId {CompanyId}, CandidateId {CandidateId}, JobDescriptionId {JobDescriptionId}.",
+        //                request.CompanyId,
+        //                request.CandidateId,
+        //                request.JobDescriptionId);
+
+        //            return Fail(500, "Unable to fetch candidate documents.");
+        //        }
+        //    }
 
 
 
         [HttpPost("DeleteCandidateOnboardingDocument")]
         public async Task<IActionResult> DeleteCandidateOnboardingDocument(
-    [FromBody] DeleteCandidateOnboardingDocumentRequest? request)
+[FromBody] DeleteCandidateOnboardingDocumentRequest? request)
         {
             IActionResult Fail(int code, string message) =>
                 StatusCode(code, new
@@ -4366,9 +7815,6 @@ public class GetOnboardingCandidateListRequest
 
             if (string.IsNullOrWhiteSpace(remarks))
                 return Fail(400, "Enter a reason for removing this document.");
-
-            if (request.RowVersion == null || request.RowVersion.Length != 8)
-                return Fail(400, "Send the document's current RowVersion.");
 
             try
             {
@@ -4550,13 +7996,6 @@ public class GetOnboardingCandidateListRequest
                         "A verified document cannot be removed through this API.");
                 }
 
-                if (!document.RowVersion.SequenceEqual(request.RowVersion))
-                {
-                    return Fail(
-                        409,
-                        "The document changed. Refresh the latest data and try again.");
-                }
-
                 string Snapshot() =>
                     System.Text.Json.JsonSerializer.Serialize(new
                     {
@@ -4718,6 +8157,7 @@ public class GetOnboardingCandidateListRequest
             public int OnboardingTeamId { get; set; }
 
             public int CompanyId { get; set; }
+
             public int UserId { get; set; }
 
             [Required]
@@ -4726,10 +8166,13 @@ public class GetOnboardingCandidateListRequest
 
             public int? CompanySkillMasterId { get; set; }
 
+            // Used when Templates is omitted.
             // Null, empty, or [0] means all company templates.
             public List<int>? TemplateIds { get; set; }
 
             public List<SaveOnboardingTeamMemberRequest>? Members { get; set; }
+
+            public List<SaveOnboardingTeamTemplateReportingRequest>? Templates { get; set; }
 
             public bool IsActive { get; set; } = true;
         }
@@ -4744,11 +8187,20 @@ public class GetOnboardingCandidateListRequest
             public bool IsActive { get; set; } = true;
         }
 
+        public class SaveOnboardingTeamTemplateReportingRequest
+        {
+            public int TemplateId { get; set; }
+
+            // Multiple reporting employees for this template.
+            // Null or empty clears its reporting selections when Templates is supplied.
+            public List<int>? ReportingToEmployeeIds { get; set; }
+        }
 
 
 
 
 
-       
+
+
     }
 }

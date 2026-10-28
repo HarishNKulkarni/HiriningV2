@@ -349,6 +349,154 @@ namespace Recruitment.Controllers
                 return Fail(500, "Unable to fetch company policies.");
             }
         }
+
+
+        [HttpPost("DeleteCompanyPolicy")]
+        public async Task<IActionResult> DeleteCompanyPolicy(
+    [FromBody] DeleteCompanyPolicyRequest? request)
+        {
+            IActionResult Fail(int code, string message)
+            {
+                return StatusCode(code, new
+                {
+                    Status = false,
+                    Message = message
+                });
+            }
+
+            if (request == null ||
+                request.CompanyId <= 0 ||
+                request.UserId <= 0)
+            {
+                return Fail(
+                    400,
+                    "Valid CompanyId and UserId are required.");
+            }
+
+            if (request.PolicyIds == null ||
+                request.PolicyIds.Count == 0 ||
+                request.PolicyIds.Any(id => id <= 0))
+            {
+                return Fail(
+                    400,
+                    "Provide at least one valid PolicyId.");
+            }
+
+            var policyIds = request.PolicyIds
+                .Distinct()
+                .ToList();
+
+            try
+            {
+                await using var transaction =
+                    await _context.Database.BeginTransactionAsync(
+                        System.Data.IsolationLevel.Serializable);
+
+                var companyExists = await _context.Companys
+                    .AsNoTracking()
+                    .AnyAsync(x => x.CompanyID == request.CompanyId);
+
+                if (!companyExists)
+                    return Fail(404, "Company not found.");
+
+                var user = await _context.EmployeeMasters
+                    .AsNoTracking()
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.EmployeeId == request.UserId)
+                    .Select(x => new
+                    {
+                        x.EmployeeId,
+                        x.IsActive
+                    })
+                    .FirstOrDefaultAsync();
+
+                if (user == null)
+                    return Fail(404, "Employee not found for this company.");
+
+                if (user.IsActive != true)
+                    return Fail(403, "Employee is inactive.");
+
+                var policies = await _context.CompanyPolicies
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        policyIds.Contains(x.PolicyId))
+                    .ToListAsync();
+
+                var foundIds = policies
+                    .Select(x => x.PolicyId)
+                    .ToHashSet();
+
+                var missingIds = policyIds
+                    .Where(id => !foundIds.Contains(id))
+                    .ToList();
+
+                if (missingIds.Count > 0)
+                {
+                    return Fail(
+                        404,
+                        "Policies not found for this company: " +
+                        string.Join(", ", missingIds));
+                }
+
+                _context.CompanyPolicies.RemoveRange(policies);
+
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+                return Ok(new
+                {
+                    Status = true,
+                    Message = "Company policies deleted successfully.",
+                    DeletedCount = policies.Count,
+                    DeletedPolicyIds = policyIds
+                });
+            }
+            catch (DbUpdateException ex)
+                when (ex.InnerException is Microsoft.Data.SqlClient.SqlException sql &&
+                      sql.Number == 547)
+            {
+                return Fail(
+                    409,
+                    "One or more policies are linked to other records and cannot be deleted.");
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                return Fail(
+                    409,
+                    "Policy records changed. Refresh the list and try again.");
+            }
+            catch (Exception ex)
+            {
+                Serilog.Log.Error(
+                    ex,
+                    "Failed to delete company policies for CompanyId {CompanyId}, UserId {UserId}.",
+                    request.CompanyId,
+                    request.UserId);
+
+                return Fail(500, "Unable to delete company policies.");
+            }
+        }
+
+
+
+
+
+
+
+
+
+
+
+
+        public class DeleteCompanyPolicyRequest
+        {
+            public int CompanyId { get; set; }
+
+            public int UserId { get; set; }
+
+            public List<int>? PolicyIds { get; set; }
+        }
         public class SaveCompanyPolicyRequest
         {
             public int CompanyId { get; set; }

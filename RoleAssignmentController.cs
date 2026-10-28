@@ -627,73 +627,232 @@ namespace Recruitment.Controllers
     //    }
 
         [HttpGet("Templatelist")]
-            public async Task<IActionResult> GetTemplateList(  [FromQuery] int companyId)
+
+        public async Task<IActionResult> GetTemplateList(
+    [FromQuery] int companyId)
+        {
+            if (companyId <= 0)
+                return Fail(400, "Valid CompanyId is required.");
+
+            try
             {
-                if (companyId <= 0)
-                    return Fail(400, "Valid CompanyId is required.");
+                var companyExists = await _context.Companys
+                    .AnyAsync(x => x.CompanyID == companyId);
 
-                try
-                {
-                    var companyExists = await _context.Companys
-                        .AnyAsync(x => x.CompanyID == companyId);
+                if (!companyExists)
+                    return Fail(404, "Company not found.");
 
-                    if (!companyExists)
-                        return Fail(404, "Company not found.");
-
-                    var templates = await _context.RoleTemplates
-                        .AsNoTracking()
-                        .Where(x => x.CompanyId == companyId)
-                        .OrderByDescending(x => x.TemplateId)
-                        .Select(x => new
-                        {
-                            x.TemplateId,
-                            x.TemplateName,
-                            x.CompanyId,
-                           
-                            x.IsActive,
-                            x.CreatedOn,
-                            x.CreatedBy,
-                            x.ModifiedOn,
-                            x.ModifiedBy,
-
-                            Branches = (
-                                from mapping in _context.RoleTemplateBranches
-                                join branch in _context.Branches
-                                    on mapping.BranchId equals branch.BranchId
-                                where mapping.TemplateId == x.TemplateId
-                                      && mapping.CompanyId == companyId
-                                      && branch.CompanyId == companyId
-                                orderby branch.BranchName
-                                select new
-                                {
-                                    mapping.TemplateBranchId,
-                                    branch.BranchId,
-                                    branch.BranchName,
-                                    branch.City
-                                }
-                            ).ToList()
-                        })
-                        .ToListAsync();
-
-                    return Ok(new
+                var templates = await _context.RoleTemplates
+                    .AsNoTracking()
+                    .Where(x => x.CompanyId == companyId)
+                    .OrderByDescending(x => x.TemplateId)
+                    .Select(x => new
                     {
-                        Status = true,
-                        Message = templates.Count > 0
-                            ? "Template list fetched successfully."
-                            : "No templates found.",
-                        Data = templates
-                    });
-                }
-                catch (Exception ex)
-                {
-                    Log.Error(
-                        ex,
-                        "Failed to fetch templates for company {CompanyId}",
-                        companyId);
+                        x.TemplateId,
+                        x.TemplateName,
+                        x.CompanyId,
 
-                    return Fail(500, "Unable to fetch template list.");
-                }
+                        x.IsActive,
+                        x.CreatedOn,
+                        x.CreatedBy,
+                        x.ModifiedOn,
+                        x.ModifiedBy,
+
+                        Branches = (
+                            from mapping in _context.RoleTemplateBranches
+                            join branch in _context.Branches
+                                on mapping.BranchId equals branch.BranchId
+                            where mapping.TemplateId == x.TemplateId
+                                  && mapping.CompanyId == companyId
+                                  && branch.CompanyId == companyId
+                            orderby branch.BranchName
+                            select new
+                            {
+                                mapping.TemplateBranchId,
+                                branch.BranchId,
+                                branch.BranchName,
+                                branch.City
+                            }
+                        ).ToList(),
+
+                        ApprovalPath = (
+                            from assignment in _context.RoleTemplateAssignment
+                                .AsNoTracking()
+
+                            where assignment.CompanyId == companyId
+                                  && assignment.TemplateId == x.TemplateId
+                                  && assignment.IsActive == true
+
+                            orderby assignment.HierarchyLevel,
+                                    assignment.AssignmentId
+
+                            select new
+                            {
+                                assignment.AssignmentId,
+                                assignment.TemplateId,
+
+                                assignment.RoleId,
+
+                                RoleName = _context.Roles
+                                    .Where(role =>
+                                        role.CompanyId == companyId &&
+                                        role.RoleId == assignment.RoleId)
+                                    .Select(role => role.RoleName)
+                                    .FirstOrDefault(),
+
+                                assignment.HierarchyLevel,
+                                assignment.EmployeeId,
+
+                                EmployeeName = _context.EmployeeMasters
+                                    .Where(employee =>
+                                        employee.CompanyId == companyId &&
+                                        employee.EmployeeId ==
+                                            assignment.EmployeeId)
+                                    .Select(employee =>
+                                        ((employee.FirstName ?? "") + " " +
+                                         (employee.LastName ?? "")).Trim())
+                                    .FirstOrDefault(),
+
+                                assignment.ReportingToAssignmentId,
+
+                                ReportingToEmployeeId =
+                                    _context.RoleTemplateAssignment
+                                        .Where(reporting =>
+                                            reporting.CompanyId == companyId &&
+                                            reporting.TemplateId == x.TemplateId &&
+                                            reporting.AssignmentId ==
+                                                assignment.ReportingToAssignmentId &&
+                                            reporting.IsActive == true)
+                                        .Select(reporting =>
+                                            (int?)reporting.EmployeeId)
+                                        .FirstOrDefault(),
+
+                                ReportingToEmployeeName = (
+                                    from reporting in
+                                        _context.RoleTemplateAssignment
+
+                                    join employee in _context.EmployeeMasters
+                                        on new
+                                        {
+                                            reporting.CompanyId,
+                                            reporting.EmployeeId
+                                        }
+                                        equals new
+                                        {
+                                            employee.CompanyId,
+                                            employee.EmployeeId
+                                        }
+
+                                    where reporting.CompanyId == companyId
+                                          && reporting.TemplateId == x.TemplateId
+                                          && reporting.AssignmentId ==
+                                              assignment.ReportingToAssignmentId
+                                          && reporting.IsActive == true
+
+                                    select
+                                        ((employee.FirstName ?? "") + " " +
+                                         (employee.LastName ?? "")).Trim()
+                                ).FirstOrDefault(),
+
+                                assignment.Stage,
+                                assignment.ApprovalDays,
+
+                                assignment.CanApprove,
+                                assignment.CanReject,
+                                assignment.CanReturn,
+
+                                assignment.IsActive
+                            }
+                        ).ToList()
+                    })
+                    .ToListAsync();
+
+                return Ok(new
+                {
+                    Status = true,
+                    Message = templates.Count > 0
+                        ? "Template list fetched successfully."
+                        : "No templates found.",
+                    Data = templates
+                });
             }
+            catch (Exception ex)
+            {
+                Log.Error(
+                    ex,
+                    "Failed to fetch templates for company {CompanyId}",
+                    companyId);
+
+                return Fail(500, "Unable to fetch template list.");
+            }
+        }
+        //public async Task<IActionResult> GetTemplateList(  [FromQuery] int companyId)
+        //{
+        //    if (companyId <= 0)
+        //        return Fail(400, "Valid CompanyId is required.");
+
+        //    try
+        //    {
+        //        var companyExists = await _context.Companys
+        //            .AnyAsync(x => x.CompanyID == companyId);
+
+        //        if (!companyExists)
+        //            return Fail(404, "Company not found.");
+
+        //        var templates = await _context.RoleTemplates
+        //            .AsNoTracking()
+        //            .Where(x => x.CompanyId == companyId)
+        //            .OrderByDescending(x => x.TemplateId)
+        //            .Select(x => new
+        //            {
+        //                x.TemplateId,
+        //                x.TemplateName,
+        //                x.CompanyId,
+
+        //                x.IsActive,
+        //                x.CreatedOn,
+        //                x.CreatedBy,
+        //                x.ModifiedOn,
+        //                x.ModifiedBy,
+
+        //                Branches = (
+        //                    from mapping in _context.RoleTemplateBranches
+        //                    join branch in _context.Branches
+        //                        on mapping.BranchId equals branch.BranchId
+        //                    where mapping.TemplateId == x.TemplateId
+        //                          && mapping.CompanyId == companyId
+        //                          && branch.CompanyId == companyId
+        //                    orderby branch.BranchName
+        //                    select new
+        //                    {
+        //                        mapping.TemplateBranchId,
+        //                        branch.BranchId,
+        //                        branch.BranchName,
+        //                        branch.City
+        //                    }
+        //                ).ToList()
+        //            })
+        //            .ToListAsync();
+
+        //        return Ok(new
+        //        {
+        //            Status = true,
+        //            Message = templates.Count > 0
+        //                ? "Template list fetched successfully."
+        //                : "No templates found.",
+        //            Data = templates
+        //        });
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        Log.Error(
+        //            ex,
+        //            "Failed to fetch templates for company {CompanyId}",
+        //            companyId);
+
+        //        return Fail(500, "Unable to fetch template list.");
+        //    }
+        //}
 
 
 
@@ -2561,6 +2720,396 @@ namespace Recruitment.Controllers
                     Message = "Unable to fetch role mapping summary."
                 });
             }
+        }
+
+
+
+        [HttpPost("DeleteRoleTemplate")]
+        public async Task<IActionResult> DeleteRoleTemplate(
+    [FromBody] DeleteRoleTemplateRequest? request)
+        {
+            IActionResult Fail(int code, string message)
+            {
+                return StatusCode(code, new
+                {
+                    Status = false,
+                    Message = message
+                });
+            }
+
+            if (request == null ||
+                request.CompanyId <= 0 ||
+                request.TemplateId <= 0 ||
+                request.UserId <= 0)
+            {
+                return Fail(
+                    400,
+                    "Valid CompanyId, TemplateId and UserId are required.");
+            }
+
+            try
+            {
+                await using var transaction =
+                    await _context.Database.BeginTransactionAsync(
+                        System.Data.IsolationLevel.Serializable);
+
+                var user = await _context.EmployeeMasters
+                    .AsNoTracking()
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.EmployeeId == request.UserId)
+                    .Select(x => new
+                    {
+                        x.EmployeeId,
+                        x.IsActive,
+                        x.IsAdmin
+                    })
+                    .FirstOrDefaultAsync();
+
+                if (user == null)
+                    return Fail(404, "Employee not found for this company.");
+
+                if (user.IsActive != true)
+                    return Fail(403, "Employee is inactive.");
+
+                if (user.IsAdmin != true)
+                {
+                    return Fail(
+                        403,
+                        "Only a company admin can delete a role template.");
+                }
+
+                var template = await _context.RoleTemplates
+                    .AsTracking()
+                    .FirstOrDefaultAsync(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.TemplateId == request.TemplateId);
+
+                if (template == null)
+                    return Fail(404, "Template not found for this company.");
+
+                // Include inactive assignments so any remaining active
+                // skill mappings under them are also deactivated.
+                var assignments = await _context.RoleTemplateAssignment
+                    .AsTracking()
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.TemplateId == request.TemplateId)
+                    .ToListAsync();
+
+                var assignmentIds = assignments
+                    .Select(x => x.AssignmentId)
+                    .ToArray();
+
+                var skillMappings = await _context.RoleTemplateAssignmentSkills
+                    .AsTracking()
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        assignmentIds.Contains(x.AssignmentId) &&
+                        x.IsActive == true)
+                    .ToListAsync();
+
+                var now = DateTime.UtcNow;
+
+                bool templateChanged = template.IsActive == true;
+
+                int deactivatedAssignmentCount = 0;
+                int deactivatedSkillMappingCount = skillMappings.Count;
+
+                if (templateChanged)
+                {
+                    template.IsActive = false;
+                    template.ModifiedBy = request.UserId;
+                    template.ModifiedOn = now;
+                }
+
+                foreach (var assignment in assignments)
+                {
+                    if (assignment.IsActive != true)
+                        continue;
+
+                    assignment.IsActive = false;
+                    assignment.ModifiedBy = request.UserId;
+                    assignment.ModifiedOn = now;
+
+                    // Keep HierarchyLevel and ReportingToAssignmentId
+                    // for historical references.
+                    deactivatedAssignmentCount++;
+                }
+
+                foreach (var mapping in skillMappings)
+                {
+                    mapping.IsActive = false;
+                }
+
+                bool changed =
+                    templateChanged ||
+                    deactivatedAssignmentCount > 0 ||
+                    deactivatedSkillMappingCount > 0;
+
+                if (changed)
+                    await _context.SaveChangesAsync();
+
+                await transaction.CommitAsync();
+
+                return Ok(new
+                {
+                    Status = true,
+                    Message = changed
+                        ? "Template and related role assignments soft-deleted successfully."
+                        : "Template and related role assignments are already inactive.",
+
+                    Data = new
+                    {
+                        template.CompanyId,
+                        template.TemplateId,
+                        template.TemplateName,
+                        template.IsActive,
+
+                        DeactivatedAssignmentCount =
+                            deactivatedAssignmentCount,
+
+                        DeactivatedSkillMappingCount =
+                            deactivatedSkillMappingCount,
+
+                        template.ModifiedBy,
+                        template.ModifiedOn
+                    }
+                });
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                return Fail(
+                    409,
+                    "Template records changed. Refresh and try again.");
+            }
+            catch (Exception ex)
+            {
+                Serilog.Log.Error(
+                    ex,
+                    "Failed to soft-delete role template {TemplateId} " +
+                    "for CompanyId {CompanyId}, UserId {UserId}.",
+                    request.TemplateId,
+                    request.CompanyId,
+                    request.UserId);
+
+                return Fail(
+                    500,
+                    "Unable to delete the role template.");
+            }
+        }
+
+
+        [HttpPost("RemoveTemplateEmployee")]
+        public async Task<IActionResult> RemoveTemplateEmployee(
+    [FromBody] RemoveTemplateEmployeeRequest? request)
+        {
+            IActionResult Fail(int code, string message)
+            {
+                return StatusCode(code, new
+                {
+                    Status = false,
+                    Message = message
+                });
+            }
+
+            if (request == null ||
+                request.CompanyId <= 0 ||
+                request.TemplateId <= 0 ||
+                request.EmployeeId <= 0 ||
+                request.UserId <= 0)
+            {
+                return Fail(
+                    400,
+                    "Valid CompanyId, TemplateId, EmployeeId and UserId are required.");
+            }
+
+            try
+            {
+                await using var transaction =
+                    await _context.Database.BeginTransactionAsync(
+                        System.Data.IsolationLevel.Serializable);
+
+                var user = await _context.EmployeeMasters
+                    .AsNoTracking()
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.EmployeeId == request.UserId)
+                    .Select(x => new
+                    {
+                        x.IsActive,
+                        x.IsAdmin
+                    })
+                    .FirstOrDefaultAsync();
+
+                if (user == null)
+                    return Fail(404, "User not found for this company.");
+
+                if (user.IsActive != true)
+                    return Fail(403, "User is inactive.");
+
+                if (user.IsAdmin != true)
+                {
+                    return Fail(
+                        403,
+                        "Only a company admin can remove a template employee.");
+                }
+
+                var templateExists = await _context.RoleTemplates
+                    .AsNoTracking()
+                    .AnyAsync(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.TemplateId == request.TemplateId);
+
+                if (!templateExists)
+                    return Fail(404, "Template not found for this company.");
+
+                // Scope removal to this employee and this template only.
+                var assignments = await _context.RoleTemplateAssignment
+                    .AsTracking()
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.TemplateId == request.TemplateId &&
+                        x.EmployeeId == request.EmployeeId)
+                    .ToListAsync();
+
+                if (assignments.Count == 0)
+                {
+                    return Fail(
+                        404,
+                        "Employee is not mapped to this template.");
+                }
+
+                var assignmentIds = assignments
+                    .Select(x => x.AssignmentId)
+                    .ToArray();
+
+                // Prevent active reporting links from pointing to a removed assignment.
+                var reportingEmployeeIds = await _context.RoleTemplateAssignment
+                    .AsNoTracking()
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.TemplateId == request.TemplateId &&
+                        x.IsActive == true &&
+                        !assignmentIds.Contains(x.AssignmentId) &&
+                        x.ReportingToAssignmentId.HasValue &&
+                        assignmentIds.Contains(x.ReportingToAssignmentId.Value))
+                    .Select(x => x.EmployeeId)
+                    .Distinct()
+                    .ToListAsync();
+
+                if (reportingEmployeeIds.Count > 0)
+                {
+                    return Fail(
+                        409,
+                        "Reassign Reporting To for these employees before removing " +
+                        "this assignment: " +
+                        string.Join(", ", reportingEmployeeIds));
+                }
+
+                var skillMappings = await _context.RoleTemplateAssignmentSkills
+                    .AsTracking()
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        assignmentIds.Contains(x.AssignmentId) &&
+                        x.IsActive == true)
+                    .ToListAsync();
+
+                var now = DateTime.UtcNow;
+                int removedAssignmentCount = 0;
+
+                foreach (var assignment in assignments)
+                {
+                    if (assignment.IsActive != true)
+                        continue;
+
+                    assignment.IsActive = false;
+                    assignment.ModifiedBy = request.UserId;
+                    assignment.ModifiedOn = now;
+
+                    removedAssignmentCount++;
+                }
+
+                foreach (var mapping in skillMappings)
+                {
+                    mapping.IsActive = false;
+                }
+
+                bool changed =
+                    removedAssignmentCount > 0 ||
+                    skillMappings.Count > 0;
+
+                if (changed)
+                    await _context.SaveChangesAsync();
+
+                await transaction.CommitAsync();
+
+                return Ok(new
+                {
+                    Status = true,
+                    Message = changed
+                        ? "Employee removed from the selected template successfully."
+                        : "Employee assignment is already inactive in this template.",
+
+                    Data = new
+                    {
+                        request.CompanyId,
+                        request.TemplateId,
+                        request.EmployeeId,
+                        AssignmentIds = assignmentIds,
+                        RemovedAssignmentCount = removedAssignmentCount,
+                        DeactivatedSkillMappingCount = skillMappings.Count
+                    }
+                });
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                return Fail(
+                    409,
+                    "Assignment records changed. Refresh and try again.");
+            }
+            catch (Exception ex)
+            {
+                Serilog.Log.Error(
+                    ex,
+                    "Failed to remove EmployeeId {EmployeeId} from TemplateId " +
+                    "{TemplateId} for CompanyId {CompanyId}.",
+                    request.EmployeeId,
+                    request.TemplateId,
+                    request.CompanyId);
+
+                return Fail(
+                    500,
+                    "Unable to remove the employee from this template.");
+            }
+        }
+
+
+
+
+        public class RemoveTemplateEmployeeRequest
+        {
+            public int CompanyId { get; set; }
+
+            public int TemplateId { get; set; }
+
+            // Employee whose assignment must be removed.
+            public int EmployeeId { get; set; }
+
+            // Admin performing this action.
+            public int UserId { get; set; }
+        }
+
+
+
+
+        public class DeleteRoleTemplateRequest
+        {
+            public int CompanyId { get; set; }
+
+            public int TemplateId { get; set; }
+
+            public int UserId { get; set; }
         }
         public class GetRoleMappingSummaryRequest
         {

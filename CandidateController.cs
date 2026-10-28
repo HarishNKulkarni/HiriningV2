@@ -3260,9 +3260,103 @@ namespace Recruitment.Controllers
         //        }
 
 
+        [HttpPost("UpdateCandidateEPId")]
+        public async Task<IActionResult> UpdateCandidateEPId(
+    [FromBody] UpdateCandidateEPIdRequest? request)
+        {
+            IActionResult Fail(int code, string message)
+            {
+                return StatusCode(code, new
+                {
+                    Status = false,
+                    Message = message
+                });
+            }
 
+            if (request == null ||
+                request.CompanyId <= 0 ||
+                request.CandidateId <= 0 ||
+                request.EPId <= 0 ||
+                request.UserId <= 0)
+            {
+                return Fail(
+                    400,
+                    "Valid CompanyId, CandidateId, EPId and UserId are required.");
+            }
 
+            try
+            {
+                var user = await _context.EmployeeMasters
+                    .AsNoTracking()
+                    .Where(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.EmployeeId == request.UserId)
+                    .Select(x => new
+                    {
+                        x.EmployeeId,
+                        x.IsActive
+                    })
+                    .FirstOrDefaultAsync();
 
+                if (user == null)
+                    return Fail(404, "Employee not found for this company.");
+
+                if (user.IsActive != true)
+                    return Fail(403, "Employee is inactive.");
+
+                var candidate = await _context.Candidates
+                    .AsTracking()
+                    .FirstOrDefaultAsync(x =>
+                        x.CompanyId == request.CompanyId &&
+                        x.CandidateId == request.CandidateId);
+
+                if (candidate == null)
+                    return Fail(404, "Candidate not found for this company.");
+
+                candidate.IsEpId = request.EPId;
+                candidate.ModifiedBy = request.UserId;
+                candidate.ModifiedOn = DateTime.UtcNow;
+
+                await _context.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    Status = true,
+                    Message = "Candidate EP ID updated successfully.",
+                    Data = new
+                    {
+                        candidate.CompanyId,
+                        candidate.CandidateId,
+                        EPId = candidate.IsEpId,
+                        IsEPCreated = candidate.IsEpId != null &&
+                                      candidate.IsEpId != 0,
+                        candidate.ModifiedBy,
+                        candidate.ModifiedOn
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                Serilog.Log.Error(
+                    ex,
+                    "Failed to update EP ID for CompanyId {CompanyId}, CandidateId {CandidateId}.",
+                    request.CompanyId,
+                    request.CandidateId);
+
+                return Fail(500, "Unable to update candidate EP ID.");
+            }
+        }
+
+        public class UpdateCandidateEPIdRequest
+        {
+            public int CompanyId { get; set; }
+
+            public int CandidateId { get; set; }
+
+            public int EPId { get; set; }
+
+            public int UserId { get; set; }
+        }
 
 
         public class GetCandidateListRequest
